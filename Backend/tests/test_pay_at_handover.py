@@ -384,11 +384,13 @@ def test_product_chapa_checkout_omits_nonpositive_split_override(market, monkeyp
     response = client.post(
         f"/api/products/{product_id}/checkout",
         headers=_headers(key="chapa-no-commission-key"),
-        json={"quantity": 1},
+        json={"quantity": 1, "payment_method": "cbe_bank"},
     )
 
     assert response.status_code == 200, response.text
     assert captured_payload["subaccounts"] == {"id": "subaccount-123"}
+    assert captured_payload["payment_options"] == "cbe"
+    assert captured_payload["meta"] == {"payment_method": "cbe_bank"}
 
 
 def test_product_return_verification_settles_and_returns_updated_order(market, monkeypatch):

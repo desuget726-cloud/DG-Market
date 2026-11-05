@@ -1665,6 +1665,7 @@ function AdminDashboard({ onLogout, onNavigate, onSessionExpired, onSessionTimeo
           rating: student.rating ?? 'No ratings',
           wallet_balance: student.wallet_balance ?? 0,
           active_listings: student.active_listings ?? 0,
+          family_alternative_payout_account: Boolean(student.family_alternative_payout_account),
           activity: student.activity ?? [{ action: 'Account synced', time: 'Recently' }],
         }));
 
@@ -4879,7 +4880,10 @@ function AdminDashboard({ onLogout, onNavigate, onSessionExpired, onSessionTimeo
                   <div className="flex min-w-0 items-center gap-3">
                     {renderUserAvatar(student)}
                     <div className="min-w-0 flex-1">
-                      <h3 title={student.name} className="truncate text-sm font-semibold text-slate-900">{student.name}</h3>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 title={student.name} className="truncate text-sm font-semibold text-slate-900">{student.name}</h3>
+                        {student.family_alternative_payout_account && <span title="Seller confirmed an alternative payout account name" className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800">Family/Alternative Payout Account</span>}
+                      </div>
                       <p title={`${student.student_id || ''} · ${student.email || ''}`} className="max-w-[220px] truncate whitespace-nowrap text-xs text-slate-500">{student.student_id} · {student.email}</p>
                     </div>
                     <input type="checkbox" checked={selectedUserIds.includes(student.id)} onChange={(event) => setSelectedUserIds((ids) => event.target.checked ? [...ids, student.id] : ids.filter((id) => id !== student.id))} aria-label={`Select ${student.name}`} className="h-4 w-4 shrink-0 accent-emerald-600" />
@@ -4928,7 +4932,10 @@ function AdminDashboard({ onLogout, onNavigate, onSessionExpired, onSessionTimeo
                       <div className="flex min-w-0 items-center gap-3">
                         {renderUserAvatar(student)}
                         <div className="min-w-0">
-                          <p title={student.name} className="truncate font-semibold text-slate-900">{student.name}</p>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p title={student.name} className="truncate font-semibold text-slate-900">{student.name}</p>
+                            {student.family_alternative_payout_account && <span title="Seller confirmed an alternative payout account name" className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800">Family/Alternative Payout Account</span>}
+                          </div>
                           <p title={`${student.student_id || ''} · ${student.email || ''}`} className="max-w-[220px] truncate whitespace-nowrap text-xs text-slate-500">{student.student_id} · {student.email}</p>
                         </div>
                       </div>

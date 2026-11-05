@@ -2,8 +2,19 @@
 import { useCallback, useEffect, useState } from 'react';
 import { notifyError, notifySuccess } from '../../utils/notify';
 import { API_BASE_URL } from '../../config';
+import {
+    getEssentialPayoutProviders,
+    payoutNameNeedsAcknowledgement,
+} from '../../utils/payoutSetupValidation';
+import PaymentProviderLogo from '../PaymentProviderLogo';
+import { PAYMENT_PROVIDER_LOGOS } from '../paymentProviderData';
 
 const inputClass = 'mt-2 block w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-emerald-500 focus:bg-white';
+const providerOptions = [
+    { key: 'cbe', payoutType: 'bank' },
+    { key: 'telebirr', payoutType: 'mobile_wallet' },
+    { key: 'cbeBirr', payoutType: 'mobile_wallet' },
+];
 
 const emptyForm = {
     business_name: '',
@@ -11,6 +22,22 @@ const emptyForm = {
     bank_code: '',
     account_number: '',
 };
+
+const getRegisteredName = (user) => String(user?.full_name || user?.fullName || user?.name || '').trim();
+const getBusinessName = (user) => String(
+    user?.business_name
+    || user?.businessName
+    || user?.shop_name
+    || user?.shopName
+    || user?.store_name
+    || user?.storeName
+    || getRegisteredName(user),
+).trim();
+const getDefaultForm = (user) => ({
+    ...emptyForm,
+    business_name: getBusinessName(user),
+    account_name: getRegisteredName(user),
+});
 
 const getSessionToken = (user) => {
     try {
@@ -33,10 +60,12 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
     const [loadingAccount, setLoadingAccount] = useState(true);
     const [loadingProviders, setLoadingProviders] = useState(true);
     const [providers, setProviders] = useState([]);
+    const [providerReloadKey, setProviderReloadKey] = useState(0);
     const [providerError, setProviderError] = useState('');
     const [payoutType, setPayoutType] = useState('bank');
-    const [form, setForm] = useState(emptyForm);
-    const [savedForm, setSavedForm] = useState(emptyForm);
+    const [nameMismatchAcknowledged, setNameMismatchAcknowledged] = useState(false);
+    const [form, setForm] = useState(() => getDefaultForm(user));
+    const [savedForm, setSavedForm] = useState(() => getDefaultForm(user));
     const [editing, setEditing] = useState(false);
     const [saving, setSaving] = useState(false);
     const [message, setMessage] = useState('');
@@ -72,17 +101,21 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
             if (data?.exists) {
                 const accountType = data.payout_type === 'mobile_wallet' ? 'mobile_wallet' : 'bank';
                 setPayoutType(accountType);
+                setNameMismatchAcknowledged(Boolean(data.name_mismatch_acknowledged));
+                const defaults = getDefaultForm(user);
                 const nextForm = {
-                    business_name: data.business_name || '',
-                    account_name: data.account_name || '',
+                    business_name: data.business_name || defaults.business_name,
+                    account_name: data.account_name || defaults.account_name,
                     bank_code: data.bank_code || '',
                     account_number: '',
                 };
                 setForm(nextForm);
                 setSavedForm(nextForm);
             } else {
-                setForm(emptyForm);
-                setSavedForm(emptyForm);
+                setNameMismatchAcknowledged(false);
+                const defaults = getDefaultForm(user);
+                setForm(defaults);
+                setSavedForm(defaults);
             }
         } catch (loadError) {
             setError(loadError.message || 'Unable to load payout account.');
@@ -101,27 +134,16 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
             setLoadingProviders(true);
             setProviderError('');
             try {
-                const [providerResponse, banksResponse] = await Promise.all([
-                    fetch(`${API_BASE_URL}/api/payout-providers?type=${encodeURIComponent(payoutType)}`, { signal: controller.signal }),
-                    fetch(`${API_BASE_URL}/api/payment/banks`, { signal: controller.signal }),
-                ]);
-                const providerData = await providerResponse.json().catch(() => ({}));
+                const banksResponse = await fetch(`${API_BASE_URL}/api/payment/banks`, { signal: controller.signal });
                 const banksData = await banksResponse.json().catch(() => ([]));
-                if (!providerResponse.ok) throw new Error(providerData?.detail || 'Unable to load payout provider list.');
-                if (!Array.isArray(providerData?.providers)) throw new Error('Payout provider service returned an invalid list.');
-                const chapaNames = new Map(Array.isArray(banksData)
-                    ? banksData.map((provider) => [String(provider?.code || ''), String(provider?.name || '')]).filter(([code, name]) => code && name)
-                    : []);
-                const availableProviders = providerData.providers
-                    .filter((provider) => provider?.code && provider?.name
-                        && String(provider.type || '').toLowerCase() === payoutType
-                        && String(provider.integration_status || '').toLowerCase() === 'available')
-                    .filter((provider) => !chapaNames.size || chapaNames.has(String(provider.code)))
-                    .map((provider) => ({
-                        code: String(provider.code),
-                        name: chapaNames.get(String(provider.code)) || String(provider.name),
-                    }));
-                if (active) setProviders(availableProviders);
+                if (!banksResponse.ok) throw new Error(banksData?.detail || 'Unable to load payout provider list.');
+                if (!Array.isArray(banksData)) throw new Error('Payout provider service returned an invalid list.');
+                if (active) {
+                    setProviders([
+                        ...getEssentialPayoutProviders(banksData, 'bank'),
+                        ...getEssentialPayoutProviders(banksData, 'mobile_wallet'),
+                    ]);
+                }
             } catch (loadError) {
                 if (!active) return;
                 setProviders([]);
@@ -138,7 +160,7 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
             controller.abort();
             window.clearTimeout(timeoutId);
         };
-    }, [payoutType]);
+    }, [providerReloadKey]);
 
     useEffect(() => {
         loadAccount();
@@ -146,11 +168,35 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
 
     const dirty = Object.keys(form).some((key) => form[key] !== savedForm[key]);
     const selectedProvider = providers.find((provider) => provider.code === form.bank_code);
+    const nameNeedsAcknowledgement = payoutNameNeedsAcknowledgement(
+        form.account_name,
+        getRegisteredName(user),
+    );
+    const availableProviderOptions = providerOptions
+        .map(({ key, payoutType: providerPayoutType }) => ({
+            key,
+            payoutType: providerPayoutType,
+            logo: PAYMENT_PROVIDER_LOGOS[key],
+            provider: providers.find((item) => item.method === providerPayoutType
+                && item.name === PAYMENT_PROVIDER_LOGOS[key].name),
+        }))
+        .filter(({ provider }) => provider);
     const providerChanged = Boolean(account && (form.bank_code !== account.bank_code || payoutType !== account.payout_type));
 
     const updateForm = (key, value) => {
         setForm((previous) => ({ ...previous, [key]: value }));
         if (key === 'account_number') setAccountNumberError('');
+        if (key === 'account_name') setNameMismatchAcknowledged(false);
+    };
+
+    const selectProvider = (provider, nextPayoutType) => {
+        setPayoutType(nextPayoutType);
+        setForm((previous) => ({
+            ...previous,
+            bank_code: provider.code,
+            account_number: previous.bank_code === provider.code ? previous.account_number : '',
+        }));
+        setAccountNumberError('');
     };
 
     const beginEdit = () => {
@@ -163,6 +209,7 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
         if (dirty && !window.confirm('Discard your unsaved payout changes?')) return;
         setForm(savedForm);
         setPayoutType(account?.payout_type === 'mobile_wallet' ? 'mobile_wallet' : 'bank');
+        setNameMismatchAcknowledged(Boolean(account?.name_mismatch_acknowledged));
         setEditing(false);
         setError('');
         setAccountNumberError('');
@@ -170,8 +217,14 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
 
     const validateForm = () => {
         const accountNumber = form.account_number.trim();
-        if (!form.business_name.trim() || !form.account_name.trim() || !form.bank_code) {
+        if (!(form.business_name.trim() || getBusinessName(user))
+            || !(form.account_name.trim() || getRegisteredName(user))
+            || !form.bank_code) {
             setError('Business name, account name, and provider are required.');
+            return false;
+        }
+        if (nameNeedsAcknowledgement && !nameMismatchAcknowledged) {
+            setError('Confirm that the different payout account name belongs to you or an authorized family member.');
             return false;
         }
         if ((!account || providerChanged) && !accountNumber) {
@@ -211,13 +264,14 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
                     ...(isEdit ? { 'x-reauth-password': password } : {}),
                 },
                 body: JSON.stringify({
-                    business_name: form.business_name.trim(),
-                    account_name: form.account_name.trim(),
+                    business_name: form.business_name.trim() || getBusinessName(user),
+                    account_name: form.account_name.trim() || getRegisteredName(user),
                     bank_code: form.bank_code,
                     payout_type: payoutType,
                     provider_id: null,
                     provider_name: selectedProvider?.name || account?.provider || '',
                     account_number: form.account_number.trim(),
+                    name_mismatch_acknowledged: nameNeedsAcknowledgement && nameMismatchAcknowledged,
                 }),
             });
             const data = await response.json().catch(() => ({}));
@@ -302,23 +356,52 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
             ) : (
                 <form onSubmit={handleSubmit} className="mt-6 grid min-w-0 gap-4 sm:grid-cols-2">
                     {account && holdActive && <div role="status" className="sm:col-span-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm font-semibold text-amber-900">Payouts are temporarily on hold until {holdDate.toLocaleString()} because these account details were changed.</div>}
-                    <div className="sm:col-span-2 flex flex-wrap gap-2 rounded-2xl bg-slate-100 p-1" role="tablist" aria-label="Payout type">
-                        {[[ 'bank', 'Traditional Banks' ], [ 'mobile_wallet', 'Mobile Wallets' ]].map(([type, label]) => (
-                            <button key={type} type="button" role="tab" aria-selected={payoutType === type} onClick={() => { setPayoutType(type); updateForm('bank_code', ''); }} className={`min-w-0 flex-1 basis-[calc(50%-0.25rem)] rounded-xl px-3 py-2 text-xs font-bold transition sm:px-4 sm:py-3 sm:text-sm ${payoutType === type ? 'bg-white text-emerald-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>{label}</button>
-                        ))}
-                    </div>
-                    <Field label="Business Name"><input required value={form.business_name} onChange={(event) => updateForm('business_name', event.target.value)} className={inputClass} placeholder="Your seller or business name" /></Field>
-                    <Field label="Account Name"><input required value={form.account_name} onChange={(event) => updateForm('account_name', event.target.value)} className={inputClass} placeholder="Name on bank account" /></Field>
-                    <Field label={payoutType === 'mobile_wallet' ? 'Mobile Wallet' : 'Ethiopian Bank'}>
-                        <select required value={form.bank_code} onChange={(event) => updateForm('bank_code', event.target.value)} className={inputClass}>
-                            <option value="">{loadingProviders ? 'Loading providers...' : providerError ? 'Unable to load provider list' : providers.length ? 'Select provider' : 'No supported providers returned'}</option>
-                            {providers.map((provider) => <option key={provider.code} value={provider.code}>{provider.name}</option>)}
-                        </select>
-                    </Field>
+                    <Field label="Business Name"><input value={form.business_name} onChange={(event) => updateForm('business_name', event.target.value)} className={inputClass} placeholder="Your seller or business name" /></Field>
+                    <Field label="Account Name"><input value={form.account_name} onChange={(event) => updateForm('account_name', event.target.value)} className={inputClass} placeholder="Name on bank account" /></Field>
+                    {nameNeedsAcknowledgement && (
+                        <label className="sm:col-span-2 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm leading-5 text-amber-900">
+                            <input
+                                type="checkbox"
+                                checked={nameMismatchAcknowledged}
+                                onChange={(event) => setNameMismatchAcknowledged(event.target.checked)}
+                                className="mt-1 h-4 w-4 shrink-0 accent-amber-700"
+                            />
+                            <span>The name on this bank account differs from your profile name. Please confirm this account belongs to you or an authorized family member.</span>
+                        </label>
+                    )}
+                    <fieldset className="sm:col-span-2 min-w-0">
+                        <legend className="text-xs font-bold uppercase tracking-[0.16em] text-slate-500">Payout Provider</legend>
+                        {loadingProviders ? (
+                            <p className="mt-2 text-sm text-slate-500">Loading providers...</p>
+                        ) : (
+                            <div className="mt-2 grid gap-3 sm:grid-cols-3" role="radiogroup" aria-label="Payout provider">
+                                {availableProviderOptions.map(({ key, payoutType: providerPayoutType, logo, provider }) => {
+                                    const isSelected = form.bank_code === provider.code && payoutType === providerPayoutType;
+                                    return (
+                                        <button
+                                            key={key}
+                                            type="button"
+                                            role="radio"
+                                            aria-checked={isSelected}
+                                            onClick={() => selectProvider(provider, providerPayoutType)}
+                                            className={`relative flex min-h-20 items-center gap-3 rounded-2xl border p-3 text-left transition hover:-translate-y-0.5 hover:border-sky-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 ${isSelected ? 'border-sky-500 bg-sky-50 ring-2 ring-sky-500/20' : 'border-slate-200 bg-white'}`}
+                                        >
+                                            <PaymentProviderLogo provider={key} className="h-12 w-12 rounded-xl border border-slate-200 bg-white" />
+                                            <span className="pr-5 text-sm font-bold leading-5 text-slate-800">{logo.name}</span>
+                                            {isSelected && <span aria-hidden="true" className="absolute right-3 top-3 flex h-5 w-5 items-center justify-center rounded-full bg-sky-600 text-xs font-black text-white">✓</span>}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
+                        {!loadingProviders && availableProviderOptions.length === 0 && !providerError && (
+                            <p className="mt-2 text-sm text-slate-500">No supported payout providers returned.</p>
+                        )}
+                    </fieldset>
                     <Field label={payoutType === 'mobile_wallet' ? 'Phone Number' : 'Account Number'}>
-                        <input inputMode="numeric" required={!account || providerChanged} pattern={payoutType === 'mobile_wallet' ? '\\d{10}' : undefined} minLength={payoutType === 'mobile_wallet' ? 10 : 10} maxLength={payoutType === 'mobile_wallet' ? 10 : 15} value={form.account_number} onChange={(event) => updateForm('account_number', event.target.value)} className={inputClass} placeholder={accountMask ? `Leave blank to keep ending ${accountMask.slice(-4)}` : payoutType === 'mobile_wallet' ? 'Enter a valid 10-digit phone number' : 'Enter a 10-15 digit account number'} />
+                        <input inputMode="numeric" required={!account || providerChanged} pattern={payoutType === 'mobile_wallet' ? '\\d{10}' : undefined} minLength={10} maxLength={payoutType === 'mobile_wallet' ? 10 : 15} value={form.account_number} onChange={(event) => updateForm('account_number', event.target.value)} className={inputClass} placeholder={accountMask && !providerChanged ? `Leave blank to keep ending ${accountMask.slice(-4)}` : payoutType === 'mobile_wallet' ? 'Enter phone number (e.g. 0912345678)' : 'Enter CBE account number (e.g. 1000...)'} />
                     </Field>
-                    {providerError && <div className="sm:col-span-2 flex items-center gap-3 text-sm font-semibold text-rose-600"><p>{providerError}</p><button type="button" onClick={() => setPayoutType((type) => type)} className="underline underline-offset-2">Retry providers</button></div>}
+                    {providerError && <div className="sm:col-span-2 flex items-center gap-3 text-sm font-semibold text-rose-600"><p>{providerError}</p><button type="button" onClick={() => setProviderReloadKey((key) => key + 1)} className="underline underline-offset-2">Retry providers</button></div>}
                     {accountNumberError && <p className="sm:col-span-2 -mt-2 text-sm font-semibold text-rose-600">{accountNumberError}</p>}
                     {error && <p role="alert" className="sm:col-span-2 text-sm font-semibold text-rose-600">{error}</p>}
                     {message && <p role="status" className="sm:col-span-2 text-sm font-semibold text-emerald-600">{message}</p>}

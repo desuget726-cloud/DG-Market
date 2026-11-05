@@ -541,12 +541,35 @@ def init_db() -> None:
             "encrypted_account_number": "VARCHAR(255) NULL",
             "account_last4": "VARCHAR(4) NULL",
             "created_at": "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            "payout_account_name": "VARCHAR(150) NULL",
+            "profile_name": "VARCHAR(150) NULL",
+            "name_mismatch_acknowledged": "BOOLEAN NOT NULL DEFAULT 0",
+            "name_verification_at": "DATETIME NULL",
         }
         for column_name, definition in payout_additions.items():
             if column_name not in payout_columns:
                 _add_column_if_missing(
                     "seller_payment_accounts", column_name, definition
                 )
+        with engine.begin() as connection:
+            connection.execute(text(
+                "UPDATE seller_payment_accounts "
+                "SET payout_account_name = account_name "
+                "WHERE payout_account_name IS NULL"
+            ))
+            connection.execute(text(
+                "UPDATE seller_payment_accounts "
+                "SET profile_name = ("
+                "SELECT students.name FROM students "
+                "WHERE UPPER(TRIM(students.student_id)) = "
+                "UPPER(TRIM(seller_payment_accounts.student_id))"
+                ") WHERE profile_name IS NULL"
+            ))
+            connection.execute(text(
+                "UPDATE seller_payment_accounts "
+                "SET name_verification_at = created_at "
+                "WHERE name_verification_at IS NULL"
+            ))
     inspector = inspect(engine)
     if "reviews" in inspector.get_table_names():
         review_constraints = {

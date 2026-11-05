@@ -92,3 +92,48 @@ class ChapaBanksTests(unittest.TestCase):
         self.assertTrue(main_module._is_valid_mobile_money_number("0712345678"))
         self.assertFalse(main_module._is_valid_mobile_money_number("0812345678"))
         self.assertFalse(main_module._is_valid_mobile_money_number("091234567"))
+
+    def test_mobile_wallet_names_resolve_to_chapa_bank_codes(self):
+        banks = [
+            {"code": "855", "name": "telebirr", "method": "mobile_wallet"},
+            {"code": "128", "name": "CBEBirr", "method": "mobile_wallet"},
+            {"code": "266", "name": "M-Pesa", "method": "mobile_wallet"},
+        ]
+
+        for requested_name, expected_code in (
+            ("telebirr", "855"),
+            ("CBEBirr", "128"),
+            ("M-Pesa", "266"),
+        ):
+            with self.subTest(requested_name=requested_name):
+                bank = main_module._resolve_chapa_bank(banks, requested_name)
+                self.assertEqual(bank["code"], expected_code)
+
+    def test_only_essential_methods_resolve_and_cbe_code_comes_from_chapa_list(self):
+        banks = [
+            {"code": "901", "name": "Commercial Bank of Ethiopia", "method": "bank"},
+            {"code": "855", "name": "telebirr", "method": "mobile_wallet"},
+            {"code": "128", "name": "CBEBirr", "method": "mobile_wallet"},
+            {"code": "266", "name": "M-Pesa", "method": "mobile_wallet"},
+            {"code": "836", "name": "Cooperative Bank of Oromia", "method": "bank"},
+        ]
+
+        cbe = main_module._resolve_chapa_bank(
+            banks, "901", "Commercial Bank of Ethiopia (CBE)", "bank"
+        )
+        telebirr = main_module._resolve_chapa_bank(
+            banks, "Telebirr", "Telebirr", "mobile_wallet"
+        )
+        cbe_birr = main_module._resolve_chapa_bank(
+            banks, "CBE Birr", "CBE Birr", "mobile_wallet"
+        )
+
+        self.assertEqual(cbe["code"], "901")
+        self.assertEqual(telebirr["code"], "855")
+        self.assertEqual(cbe_birr["code"], "128")
+        self.assertIsNone(main_module._resolve_chapa_bank(
+            banks, "266", "M-Pesa", "mobile_wallet"
+        ))
+        self.assertIsNone(main_module._resolve_chapa_bank(
+            banks, "836", "Cooperative Bank of Oromia", "bank"
+        ))

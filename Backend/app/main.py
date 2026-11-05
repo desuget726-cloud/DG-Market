@@ -4,6 +4,7 @@ import os
 import logging
 import re
 import traceback
+import unicodedata
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 logging.basicConfig(level=logging.INFO)
@@ -165,6 +166,19 @@ _CHAPA_MOBILE_PROVIDER_PAYOUT_SUPPORT = {
     "266": True,
     "855": True,
     "867": False,
+}
+_ESSENTIAL_CHAPA_PROVIDER_NAMES = {
+    "bank": {
+        "cbe": {
+            "cbe",
+            "commercialbankofethiopia",
+            "commercialbankofethiopiacbe",
+        },
+    },
+    "mobile_wallet": {
+        "telebirr": {"telebirr"},
+        "cbe_birr": {"cbebirr"},
+    },
 }
 
 GOOGLE_REDIRECT_URI_DEFAULT = "http://localhost:8000/auth/google/callback"
@@ -2359,7 +2373,8 @@ class SellerPayoutSetupRequest(BaseModel):
     provider_name: Optional[str] = None
     bank_code: str
     account_number: Optional[str] = None
-    account_name: str
+    account_name: Optional[str] = None
+    name_mismatch_acknowledged: bool = False
 
 
 def normalize_student_id(value: Optional[str]) -> str:
@@ -2376,6 +2391,59 @@ def _mask_account_value(value: Optional[str], keep_last: int = 4) -> str:
     if len(digits_only) <= keep_last:
         return "****" + digits_only
     return "****" + digits_only[-keep_last:]
+
+
+def _payout_name_tokens(value: Optional[str]) -> List[str]:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    normalized = "".join(character for character in normalized if not unicodedata.combining(character)).casefold()
+    return re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+
+
+def _payout_name_matches_profile(payout_name: Optional[str], profile_name: Optional[str]) -> bool:
+    payout_tokens = _payout_name_tokens(payout_name)
+    profile_tokens = _payout_name_tokens(profile_name)
+    if not payout_tokens or not profile_tokens:
+        return False
+
+    def tokens_match(left: str, right: str) -> bool:
+        return left == right or (
+            min(len(left), len(right)) >= 3
+            and left[:3] == right[:3]
+        )
+
+    if any(tokens_match(payout_token, profile_token)
+           for payout_token in payout_tokens
+           for profile_token in profile_tokens):
+        return True
+
+    shorter_tokens, longer_tokens = (
+        (payout_tokens, profile_tokens)
+        if len(payout_tokens) <= len(profile_tokens)
+        else (profile_tokens, payout_tokens)
+    )
+    if not all(len(initial) == 1 for initial in shorter_tokens):
+        return False
+    matched_token_indexes = set()
+    for initial in shorter_tokens:
+        match_index = next(
+            (
+                index for index, token in enumerate(longer_tokens)
+                if index not in matched_token_indexes and token.startswith(initial)
+            ),
+            None,
+        )
+        if match_index is None:
+            return False
+        matched_token_indexes.add(match_index)
+    return True
+
+
+def _payout_name_needs_acknowledgement(payout_name: Optional[str], profile_name: Optional[str]) -> bool:
+    return bool(
+        str(payout_name or "").strip()
+        and str(profile_name or "").strip()
+        and not _payout_name_matches_profile(payout_name, profile_name)
+    )
 
 
 def _payout_account_cipher() -> Fernet:
@@ -2442,6 +2510,10 @@ def _student_payout_payload(db: Session, account: SellerPaymentAccount) -> dict:
         "bank_code": account.bank_code,
         "business_name": account.business_name,
         "account_name": account.account_name,
+        "payout_account_name": account.payout_account_name or account.account_name,
+        "profile_name": account.profile_name,
+        "name_mismatch_acknowledged": bool(account.name_mismatch_acknowledged),
+        "name_verification_at": account.name_verification_at.isoformat() if account.name_verification_at else None,
         "account_number_masked": masked_account,
         "phone_number_masked": masked_account,
         "account_last4": account_last4,
@@ -2993,6 +3065,7 @@ class ProductCheckoutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     quantity: int = Field(ge=1, strict=True)
+    payment_method: Literal["telebirr", "cbe_birr", "cbe_bank"] = "telebirr"
 
 
 class WalletPinSetRequest(BaseModel):
@@ -9128,6 +9201,51 @@ def _normalize_payout_type(value: Optional[str]) -> str:
     return "bank"
 
 
+def _normalize_chapa_bank_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _resolve_chapa_bank(
+    banks: List[dict],
+    bank_code: str,
+    provider_name: Optional[str] = None,
+    payout_type: Optional[str] = None,
+) -> Optional[dict]:
+    provider_names = _ESSENTIAL_CHAPA_PROVIDER_NAMES.get(payout_type) if payout_type else None
+
+    def provider_key(value: Any) -> Optional[str]:
+        normalized = _normalize_chapa_bank_name(value)
+        if provider_names is None:
+            return normalized or None
+        return next(
+            (key for key, aliases in provider_names.items() if normalized in aliases),
+            None,
+        )
+
+    selected_bank = next(
+        (
+            bank for bank in banks
+            if str(bank.get("code") or "").strip() == bank_code
+            and provider_key(bank.get("name"))
+        ),
+        None,
+    )
+    if selected_bank:
+        return selected_bank
+
+    requested_provider_keys = {
+        key for key in (provider_key(bank_code), provider_key(provider_name)) if key
+    }
+
+    return next(
+        (
+            bank for bank in banks
+            if provider_key(bank.get("name")) in requested_provider_keys
+        ),
+        None,
+    )
+
+
 def _is_valid_mobile_money_number(value: str) -> bool:
     return re.fullmatch(r"(?:09|07)[0-9]{8}", value) is not None
 
@@ -9300,10 +9418,19 @@ def _resolve_selected_provider(db: Session, payload: SellerPayoutSetupRequest) -
         return provider
 
     seeded_providers = _seed_default_payout_providers(db)
-    provider_name = str(payload.provider_name or "").strip().casefold()
-    if provider_name:
-        provider = next((item for item in seeded_providers
-                         if item.type == provider_type and item.name.strip().casefold() == provider_name), None)
+    requested_names = {
+        name for name in (
+            _normalize_chapa_bank_name(payload.bank_code),
+            _normalize_chapa_bank_name(payload.provider_name),
+        )
+        if name
+    }
+    if requested_names:
+        provider = next((
+            item for item in seeded_providers
+            if item.type == provider_type
+            and _normalize_chapa_bank_name(item.name) in requested_names
+        ), None)
     if provider is not None:
         return provider
 
@@ -10328,7 +10455,7 @@ async def _create_chapa_subaccount(
         if commission_percent > 0:
             request_payload.update({
                 "split_type": "percentage",
-                "split_value": str(commission_percent.quantize(Decimal("0.0001"))),
+                "split_value": float(commission_percent / Decimal("100")),
             })
 
     logger = logging.getLogger("app.payments")
@@ -10370,10 +10497,15 @@ async def _create_chapa_subaccount(
     failed_status = bool(chapa_status and chapa_status not in {"success", "successful", "updated"})
 
     if response.is_error or failed_status or not subaccount_id:
+        raw_response_text = _sanitize_chapa_diagnostic(response.text, sensitive_values)
         logger.warning(
             "Chapa subaccount request rejected method=%s path=%s status=%s fields=%s message=%s validation_fields=%s validation_errors=%s",
             method, path, response.status_code, request_fields, message,
             validation_fields, validation_errors,
+        )
+        logger.warning(
+            "Chapa subaccount response method=%s path=%s status=%s response_text=%r",
+            method, path, response.status_code, raw_response_text,
         )
         if "this subaccount does exist" in message.casefold():
             raise HTTPException(
@@ -10486,21 +10618,37 @@ async def _create_student_payout_account(
         }
 
     payout_type = _normalize_payout_type(payload.payout_type)
-    account_number = str(payload.account_number or "").strip()
-    account_name = " ".join(str(payload.account_name or "").split())
+    submitted_account_number = str(payload.account_number or "").strip()
+    account_number = (
+        re.sub(r"\D", "", submitted_account_number)
+        if payout_type == "mobile_wallet"
+        else submitted_account_number
+    )
+    registered_name = " ".join(str(locked_student.name or "").split())
+    account_name = " ".join(str(payload.account_name or "").split()) or registered_name
+    business_name = " ".join(str(payload.business_name or "").split()) or registered_name
     if not account_number or not account_name:
         raise HTTPException(status_code=400, detail="Account holder name and account number are required.")
     if not account_number.isdigit():
         raise HTTPException(status_code=400, detail="Account number must contain digits only.")
-    verified_name = " ".join(str(locked_student.name or "").split()).casefold()
-    if account_name.casefold() != verified_name:
-        raise HTTPException(status_code=400, detail="The payout account name must match the verified student's name.")
+    name_mismatch = _payout_name_needs_acknowledgement(account_name, registered_name)
+    if name_mismatch and not payload.name_mismatch_acknowledged:
+        raise HTTPException(
+            status_code=400,
+            detail="Confirm that the different payout account name belongs to you or an authorized family member.",
+        )
 
     banks = await get_chapa_banks()
-    bank_code = str(payload.bank_code or "").strip()
-    selected_bank = next((bank for bank in banks if str(bank.get("code")) == bank_code), None)
+    requested_bank_code = str(payload.bank_code or "").strip()
+    selected_bank = _resolve_chapa_bank(
+        banks,
+        requested_bank_code,
+        payload.provider_name,
+        payout_type,
+    )
     if not selected_bank or selected_bank.get("method") != payout_type:
         raise HTTPException(status_code=422, detail="Select a supported payout method and bank from the list.")
+    bank_code = str(selected_bank.get("code") or "").strip()
     if not bank_code.isdigit():
         raise HTTPException(status_code=422, detail="This Chapa payout destination is not currently supported.")
     provider = db.query(PayoutProvider).filter(PayoutProvider.code == bank_code).first()
@@ -10531,7 +10679,7 @@ async def _create_student_payout_account(
     subaccount_id = await _create_chapa_subaccount(
         db,
         {
-            "business_name": (payload.business_name or locked_student.name).strip(),
+            "business_name": business_name,
             "bank_code": bank_code,
             "account_number": account_number,
             "account_name": account_name,
@@ -10550,19 +10698,35 @@ async def _create_student_payout_account(
         db.add(provider)
         db.flush()
 
+    name_verification_at = datetime.now(timezone.utc).replace(tzinfo=None)
     account = SellerPaymentAccount(
         student_id=normalize_student_id(locked_student.student_id),
         provider_id=provider.id,
         chapa_sub_account_id=subaccount_id,
-        business_name=(payload.business_name or locked_student.name).strip(),
+        business_name=business_name,
         payout_type=payout_type,
         bank_code=bank_code,
         account_name=account_name,
+        payout_account_name=account_name,
+        profile_name=registered_name,
+        name_mismatch_acknowledged=name_mismatch and payload.name_mismatch_acknowledged,
+        name_verification_at=name_verification_at,
         account_status="Active",
-        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        created_at=name_verification_at,
     )
     _store_payout_account_number(account, account_number)
     db.add(account)
+    if name_mismatch:
+        db.flush()
+        db.add(AuditLog(
+            admin_id=None,
+            action="Alternative Payout Account Acknowledged",
+            entity_type="SellerPaymentAccount",
+            entity_id=account.id,
+            description="Seller confirmed an alternative payout account name.",
+            status="SUCCESS",
+            severity="info",
+        ))
     try:
         db.commit()
     except IntegrityError as error:
@@ -10642,6 +10806,8 @@ async def update_seller_payout_account(
 
     current_number = _decrypt_payout_account_number(account)
     submitted_number = str(payload.account_number or '').strip()
+    if payout_type == "mobile_wallet" and submitted_number:
+        submitted_number = re.sub(r"\D", "", submitted_number)
     provider_changed = provider.code != account.bank_code or payout_type != account.payout_type
     if provider_changed and not submitted_number:
         raise HTTPException(status_code=400, detail="Enter the account number for the new payout provider.")
@@ -10657,12 +10823,21 @@ async def update_seller_payout_account(
     if payout_type == "bank" and provider.code.lower() != "comari" and not 10 <= len(target_number) <= 15:
         raise HTTPException(status_code=400, detail="Account number must be between 10 and 15 digits for this bank.")
 
-    next_account_name = " ".join(str(payload.account_name or "").split())
-    if next_account_name.casefold() != " ".join(str(student.name or "").split()).casefold():
-        raise HTTPException(status_code=400, detail="The payout account name must match the verified student's name.")
+    registered_name = " ".join(str(student.name or "").split())
+    next_account_name = " ".join(str(payload.account_name or "").split()) or registered_name
+    name_mismatch = _payout_name_needs_acknowledgement(next_account_name, registered_name)
+    if name_mismatch and not payload.name_mismatch_acknowledged:
+        raise HTTPException(
+            status_code=400,
+            detail="Confirm that the different payout account name belongs to you or an authorized family member.",
+        )
+    next_business_name = " ".join(str(payload.business_name or "").split()) or registered_name
     next_values = {
-        "business_name": str(payload.business_name or student.name).strip(),
+        "business_name": next_business_name,
         "account_name": next_account_name,
+        "payout_account_name": next_account_name,
+        "profile_name": registered_name,
+        "name_mismatch_acknowledged": name_mismatch and payload.name_mismatch_acknowledged,
         "bank_code": provider.code,
         "provider_id": provider.id,
         "payout_type": payout_type,
@@ -10679,9 +10854,18 @@ async def update_seller_payout_account(
         return {"success": True, **_student_payout_payload(db, account)}
 
     banks = await get_chapa_banks()
-    selected_bank = next((bank for bank in banks if str(bank.get("code")) == provider.code), None)
+    selected_bank = _resolve_chapa_bank(
+        banks,
+        provider.code,
+        provider.name,
+        payout_type,
+    )
     if not selected_bank or selected_bank.get("method") != payout_type:
         raise HTTPException(status_code=422, detail="Select a supported payout method and bank from the list.")
+    chapa_bank_code = str(selected_bank.get("code") or "").strip()
+    if not chapa_bank_code.isdigit():
+        raise HTTPException(status_code=422, detail="This Chapa payout destination is not currently supported.")
+    next_values["bank_code"] = chapa_bank_code
     try:
         secret = get_chapa_secret_key()
         _encrypt_payout_account_number(target_number)
@@ -10693,7 +10877,7 @@ async def update_seller_payout_account(
         db,
         {
             "business_name": next_values["business_name"],
-            "bank_code": next_values["bank_code"],
+            "bank_code": chapa_bank_code,
             "account_number": target_number,
             "account_name": next_values["account_name"],
         },
@@ -10705,6 +10889,7 @@ async def update_seller_payout_account(
     _store_payout_account_number(account, target_number)
     account.chapa_sub_account_id = replacement_subaccount_id
     now = datetime.now(timezone.utc)
+    account.name_verification_at = now.replace(tzinfo=None)
     account.updated_at = now
     account.payout_hold_until = now + timedelta(hours=24)
     old_last4 = _mask_account_value(current_number)
@@ -10727,6 +10912,17 @@ async def update_seller_payout_account(
         severity='warning',
         ip_address=request.client.host if request.client else None,
     ))
+    if name_mismatch:
+        db.add(AuditLog(
+            admin_id=None,
+            action='Alternative Payout Account Acknowledged',
+            entity_type='SellerPaymentAccount',
+            entity_id=account.id,
+            description='Seller confirmed an alternative payout account name.',
+            status='SUCCESS',
+            severity='info',
+            ip_address=request.client.host if request.client else None,
+        ))
     try:
         db.commit()
         db.refresh(account)
@@ -10780,6 +10976,10 @@ def get_seller_payout_account(
             "method": account.payout_type,
             "bank_code": account.bank_code,
             "account_name": account.account_name,
+            "payout_account_name": account.payout_account_name or account.account_name,
+            "profile_name": account.profile_name,
+            "name_mismatch_acknowledged": bool(account.name_mismatch_acknowledged),
+            "name_verification_at": account.name_verification_at.isoformat() if account.name_verification_at else None,
             "business_name": account.business_name,
             "account_status": account.account_status,
             "account_last4": account_last4,
@@ -16695,6 +16895,12 @@ async def initialize_product_chapa_checkout(
         "callback_url": callback_url,
         "return_url": return_url,
         "customization": {"title": marketplace_name},
+        "payment_options": {
+            "telebirr": "telebirr",
+            "cbe_birr": "cbebirr",
+            "cbe_bank": "cbe",
+        }[payload.payment_method],
+        "meta": {"payment_method": payload.payment_method},
         "subaccounts": {
             "id": seller_account.chapa_sub_account_id,
             **(
@@ -21710,6 +21916,13 @@ def get_admin_users(
 
     students = query.order_by(Student.id.desc()).all()
     results = []
+    payout_account_flags = {
+        normalize_student_id(student_id): bool(name_mismatch_acknowledged)
+        for student_id, name_mismatch_acknowledged in db.query(
+            SellerPaymentAccount.student_id,
+            SellerPaymentAccount.name_mismatch_acknowledged,
+        ).all()
+    }
 
     for s in students:
         active_listing_count = db.query(Product).filter(
@@ -21733,6 +21946,9 @@ def get_admin_users(
             "restriction_reason": s.restriction_reason,
             "wallet_balance": wallet_balance,
             "active_listings": active_listing_count,
+            "family_alternative_payout_account": payout_account_flags.get(
+                normalize_student_id(s.student_id), False
+            ),
             "rating": "No ratings",
             "activity": [{"action": "Account synced", "time": "Recently"}],
             "role": "Student",

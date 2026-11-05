@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react';
+import { Check, LockKeyhole, ShieldCheck } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { API_BASE_URL, IMAGE_PLACEHOLDER, resolveImageUrl } from '../../config';
 import { useLanguage } from '../../context/LanguageContext';
@@ -12,6 +13,7 @@ import {
   startProductActionLogin,
 } from '../../utils/productActionState';
 import { buildOrderDashboardUrl } from '../../utils/orderDashboardLink';
+import PaymentProviderLogo from '../PaymentProviderLogo';
 
 const isVerifiedStudent = (student) => [true, 1, '1', 'true'].includes(student?.is_verified);
 const PRODUCT_VIEW_STORAGE_KEY = 'viewed_products';
@@ -141,6 +143,7 @@ function ProductDetails({ product, currentUser, pendingAction, onPendingActionHa
   const [offerAmount, setOfferAmount] = useState('');
   const [showPayModal, setShowPayModal] = useState(false);
   const [paySummary, setPaySummary] = useState(null);
+  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('telebirr');
   const [payStatusMessage, setPayStatusMessage] = useState('');
   const [payError, setPayError] = useState('');
   const [payLoading, setPayLoading] = useState(false);
@@ -624,7 +627,10 @@ function ProductDetails({ product, currentUser, pendingAction, onPendingActionHa
           'Idempotency-Key': requestKey,
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
-        body: JSON.stringify({ quantity: selectedQuantity }),
+        body: JSON.stringify({
+          quantity: selectedQuantity,
+          payment_method: selectedPaymentMethod,
+        }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || (!data.checkout_url && !data.already_paid)) {
@@ -1574,17 +1580,30 @@ function ProductDetails({ product, currentUser, pendingAction, onPendingActionHa
         </div>
       )}
       {showPayModal && (
-        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/70 p-4">
-          <section role="dialog" aria-modal="true" aria-labelledby="chapa-pay-title" className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-3xl bg-white p-6 shadow-2xl sm:p-8">
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/70 p-3 backdrop-blur-md sm:p-4">
+          <section role="dialog" aria-modal="true" aria-labelledby="chapa-pay-title" className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-3xl border border-white/70 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900 sm:p-7">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <p className="text-xs font-bold uppercase tracking-[0.2em] text-emerald-700">Secure online checkout</p>
-                <h2 id="chapa-pay-title" className="mt-2 text-2xl font-black text-slate-950">Pay with Chapa</h2>
+                <div className="inline-flex items-center gap-1.5 rounded-full border border-emerald-100 bg-emerald-50 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-emerald-800">
+                  <LockKeyhole aria-hidden="true" className="h-3 w-3" />
+                  256-bit Encrypted Checkout
+                </div>
+                <h2 id="chapa-pay-title" className="mt-3 text-2xl font-black tracking-tight text-slate-950 dark:text-white">Pay with Chapa</h2>
+                <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">A secure payment, made simple.</p>
               </div>
-              <button type="button" onClick={() => setShowPayModal(false)} disabled={payLoading} className="rounded-full border border-slate-200 px-3 py-1 text-xl font-bold text-slate-500 hover:bg-slate-50 disabled:opacity-50" aria-label="Close payment dialog">×</button>
+              <button
+                type="button"
+                onClick={() => setShowPayModal(false)}
+                disabled={payLoading}
+                className="rounded-full border border-slate-200 p-2 text-slate-500 transition duration-200 hover:rotate-90 hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800 dark:hover:text-white"
+                aria-label="Close payment dialog"
+              >
+                <span aria-hidden="true" className="block text-xl leading-4">×</span>
+              </button>
             </div>
-            <p role="note" className="mt-5 rounded-2xl border-2 border-amber-300 bg-amber-50 px-4 py-3 text-sm font-bold leading-6 text-amber-950">
-              Make sure you have inspected the product in person before completing the payment.
+            <p role="note" className="mt-5 flex items-center gap-2.5 rounded-xl border border-amber-200/80 bg-amber-50/70 px-3.5 py-3 text-sm font-medium leading-5 text-amber-900 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200">
+              <ShieldCheck aria-hidden="true" className="h-5 w-5 shrink-0 text-amber-700" />
+              <span>Campus Handover: Inspect item before completing payment.</span>
             </p>
             {payResult ? (
               <div className="mt-6 space-y-4">
@@ -1597,21 +1616,84 @@ function ProductDetails({ product, currentUser, pendingAction, onPendingActionHa
             ) : (
               <>
                 {paySummary && (
-                  <dl className="mt-6 space-y-3 rounded-2xl bg-slate-50 p-4 text-sm">
-                    <div className="flex justify-between gap-4"><dt className="text-slate-500">Item</dt><dd className="text-right font-bold text-slate-900">{paySummary.title}</dd></div>
-                    <div className="flex justify-between gap-4"><dt className="text-slate-500">Unit price</dt><dd className="font-bold text-slate-900">{paySummary.unit_price} ETB</dd></div>
-                    <div className="flex justify-between gap-4"><dt className="text-slate-500">Quantity</dt><dd className="font-bold text-slate-900">{selectedQuantity}</dd></div>
-                    <div className="flex justify-between gap-4 border-t border-slate-200 pt-3"><dt className="font-bold text-slate-700">Total</dt><dd className="font-black text-slate-950">{paySummary.total} ETB</dd></div>
-                    <div className="flex justify-between gap-4"><dt className="text-slate-500">Seller</dt><dd className="font-bold text-slate-900">{paySummary.seller_name}</dd></div>
-                    <div className="flex justify-between gap-4"><dt className="text-slate-500">Platform commission (deducted from seller payout)</dt><dd className="font-bold text-slate-900">{paySummary.seller_commission} ETB</dd></div>
+                  <dl className="mt-5 space-y-3 rounded-xl border border-slate-100 bg-slate-50 p-4 text-sm dark:border-slate-700/60 dark:bg-slate-800/50">
+                    <div className="flex items-start justify-between gap-4">
+                      <dt className="min-w-0">
+                        <span className="block truncate font-semibold text-slate-900 dark:text-white">{paySummary.title}</span>
+                        <span className="mt-1 block text-xs text-slate-500 dark:text-slate-400">Qty {selectedQuantity} <span aria-hidden="true">·</span> {paySummary.unit_price} ETB each</span>
+                      </dt>
+                      <dd className="shrink-0 font-semibold text-slate-900 dark:text-slate-100">{(Number(paySummary.unit_price) * selectedQuantity).toFixed(2)} ETB</dd>
+                    </div>
+                    <div className="flex justify-between gap-4 text-xs text-slate-500 dark:text-slate-400">
+                      <dt>Seller</dt>
+                      <dd className="text-right">{paySummary.seller_name}</dd>
+                    </div>
+                    <div className="flex justify-between gap-4 text-xs text-slate-500 dark:text-slate-400">
+                      <dt>Platform commission <span className="text-slate-400 dark:text-slate-500">(deducted from seller payout)</span></dt>
+                      <dd className="shrink-0">{paySummary.seller_commission} ETB</dd>
+                    </div>
+                    <div className="flex items-center justify-between gap-4 border-t border-slate-200 pt-3 dark:border-slate-700">
+                      <dt className="font-semibold text-slate-700 dark:text-slate-300">Total amount</dt>
+                      <dd className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">{Number(paySummary.total).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ETB</dd>
+                    </div>
                   </dl>
                 )}
                 {payError && <p role="alert" className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-sm font-semibold text-rose-800">{payError}</p>}
                 {payStatusMessage && <p role="status" className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-3 text-sm font-semibold text-emerald-800">{payStatusMessage}</p>}
                 {!paySummary && <p className="mt-5 text-sm text-slate-500">Loading payment summary…</p>}
                 {paySummary && (
-                  <form onSubmit={submitProductPayment} className="mt-5 space-y-4">
-                    <button type="submit" disabled={payLoading} className="w-full rounded-full bg-emerald-600 py-3.5 text-sm font-black text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50">{payLoading ? 'Opening Chapa…' : `Continue to Chapa · ${paySummary.total} ETB`}</button>
+                  <form onSubmit={submitProductPayment} className="mt-5 space-y-5">
+                    <div>
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <p className="text-sm font-bold text-slate-900 dark:text-white">Payment method</p>
+                        <span className="text-xs text-slate-500 dark:text-slate-400">Choose one to continue</span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2.5" role="group" aria-label="Choose a payment method">
+                        {[
+                          { id: 'telebirr', label: 'Telebirr', provider: 'telebirr' },
+                          { id: 'cbe_birr', label: 'CBE Birr', provider: 'cbeBirr' },
+                          { id: 'cbe_bank', label: 'CBE Bank', provider: 'cbe' },
+                        ].map(({ id, label, provider }) => {
+                          const isSelected = selectedPaymentMethod === id;
+                          return (
+                            <button
+                              key={id}
+                              type="button"
+                              aria-label={label}
+                              aria-pressed={isSelected}
+                              onClick={() => setSelectedPaymentMethod(id)}
+                              className={`relative flex min-h-28 transform flex-col items-center justify-center gap-2 rounded-xl p-3 text-xs font-bold transition-all duration-200 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 ${
+                                isSelected
+                                  ? 'scale-[1.02] border-2 border-emerald-500 bg-emerald-50/20 text-emerald-900 shadow-sm dark:text-emerald-300'
+                                  : 'border border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-slate-600 dark:hover:bg-slate-800'
+                              }`}
+                            >
+                              {isSelected && (
+                                <span aria-hidden="true" className="absolute right-2 top-2 flex h-5 w-5 items-center justify-center rounded-full bg-emerald-600 text-white shadow-sm">
+                                  <Check className="h-3 w-3" strokeWidth={3} />
+                                </span>
+                              )}
+                              <span className={`transition-transform duration-200 ${isSelected ? 'scale-110' : ''}`}>
+                                <PaymentProviderLogo provider={provider} className="h-10 w-10 rounded-lg border border-slate-100 bg-white" />
+                              </span>
+                              <span className="text-center text-[11px] sm:text-xs">{label}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <button type="submit" disabled={payLoading} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-emerald-700 px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-emerald-900/15 transition-all duration-200 hover:-translate-y-0.5 hover:from-emerald-700 hover:to-emerald-800 hover:shadow-emerald-900/25 active:translate-y-0 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50">
+                      {!payLoading && <LockKeyhole aria-hidden="true" className="h-4 w-4" />}
+                      {payLoading
+                        ? 'Opening Chapa…'
+                        : `Pay ${Number(paySummary.total).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ETB via ${
+                          selectedPaymentMethod === 'telebirr'
+                            ? 'Telebirr'
+                            : selectedPaymentMethod === 'cbe_birr'
+                              ? 'CBE Birr'
+                              : 'CBE Bank'
+                        }`}
+                    </button>
                   </form>
                 )}
               </>

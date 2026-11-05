@@ -49,7 +49,7 @@ class SellerPayoutAccountTests(unittest.TestCase):
             is_verified=True,
         )
         self.provider = PayoutProvider(
-            name="Test Bank",
+            name="Commercial Bank of Ethiopia (CBE)",
             type="bank",
             code="123",
             is_active=True,
@@ -61,7 +61,12 @@ class SellerPayoutAccountTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
-    def payload(self, account_number="1234567890123"):
+    def payload(
+        self,
+        account_number="1234567890123",
+        account_name="Payout Seller",
+        name_mismatch_acknowledged=False,
+    ):
         return main_module.SellerPayoutSetupRequest(
             business_name="Test Shop",
             payout_type="bank",
@@ -69,7 +74,8 @@ class SellerPayoutAccountTests(unittest.TestCase):
             provider_name=self.provider.name,
             bank_code=self.provider.code,
             account_number=account_number,
-            account_name="Payout Seller",
+            account_name=account_name,
+            name_mismatch_acknowledged=name_mismatch_acknowledged,
         )
 
     def request(self, password=None):
@@ -94,6 +100,8 @@ class SellerPayoutAccountTests(unittest.TestCase):
             bank_code=self.provider.code,
             account_number="1234567890123",
             account_name="Payout Seller",
+            payout_account_name="Payout Seller",
+            profile_name=self.student.name,
             account_status="Active",
         )
         self.db.add(account)
@@ -143,6 +151,168 @@ class SellerPayoutAccountTests(unittest.TestCase):
         self.assertEqual(stored_payload["account"]["account_number_masked"], "****0123")
         self.assertNotIn("1234567890123", repr(stored_payload))
         create_subaccount.assert_awaited_once()
+
+    def test_setup_defaults_blank_names_to_registered_student_name(self):
+        payload = main_module.SellerPayoutSetupRequest(
+            bank_code=self.provider.code,
+            account_number="1234567890123",
+        )
+        banks = AsyncMock(return_value=[{
+            "code": self.provider.code,
+            "name": self.provider.name,
+            "method": "bank",
+        }])
+        create_subaccount = AsyncMock(return_value="chapa-test-subaccount")
+        encryption_key = Fernet.generate_key().decode("ascii")
+        with patch.object(main_module, "_student_from_authorization", return_value=self.student), \
+                patch.object(main_module, "get_chapa_banks", banks), \
+                patch.object(main_module, "_create_chapa_subaccount", create_subaccount), \
+                patch.dict(os.environ, {
+                    "PAYOUT_ACCOUNT_ENCRYPTION_KEY": encryption_key,
+                    "CHAPA_TEST_SECRET_KEY": "test-secret",
+                }):
+            asyncio.run(main_module.setup_seller_payout_account(
+                payload, authorization="test-token", db=self.db
+            ))
+
+        chapa_payload = create_subaccount.await_args.args[1]
+        self.assertEqual(chapa_payload["business_name"], self.student.name)
+        self.assertEqual(chapa_payload["account_name"], self.student.name)
+        account = self.db.query(SellerPaymentAccount).one()
+        self.assertEqual(account.business_name, self.student.name)
+        self.assertEqual(account.account_name, self.student.name)
+
+    def test_backend_name_matching_accepts_shared_names_and_matching_initials(self):
+        self.assertTrue(main_module._payout_name_matches_profile("Desu", "Desalegn"))
+        self.assertTrue(main_module._payout_name_matches_profile("Desu Mekonnen", "Desalegn Mekonnen"))
+        self.assertTrue(main_module._payout_name_matches_profile("D M", "Desalegn Mekonnen"))
+        self.assertFalse(main_module._payout_name_matches_profile("Authorized Family", "Desalegn Mekonnen"))
+
+    def test_setup_accepts_fuzzy_profile_name_match_without_acknowledgment(self):
+        self.student.name = "Desalegn Mekonnen"
+        banks = AsyncMock(return_value=[{
+            "code": self.provider.code,
+            "name": self.provider.name,
+            "method": "bank",
+        }])
+        create_subaccount = AsyncMock(return_value="chapa-test-subaccount")
+        encryption_key = Fernet.generate_key().decode("ascii")
+        with patch.object(main_module, "_student_from_authorization", return_value=self.student), \
+                patch.object(main_module, "get_chapa_banks", banks), \
+                patch.object(main_module, "_create_chapa_subaccount", create_subaccount), \
+                patch.dict(os.environ, {
+                    "PAYOUT_ACCOUNT_ENCRYPTION_KEY": encryption_key,
+                    "CHAPA_TEST_SECRET_KEY": "test-secret",
+                }):
+            result = asyncio.run(main_module.setup_seller_payout_account(
+                self.payload(account_name="Desu Mekonnen"),
+                authorization="test-token",
+                db=self.db,
+            ))
+
+        account = self.db.query(SellerPaymentAccount).one()
+        self.assertEqual(result["account"]["account_name"], "Desu Mekonnen")
+        self.assertEqual(account.profile_name, "Desalegn Mekonnen")
+        self.assertEqual(account.payout_account_name, "Desu Mekonnen")
+        self.assertFalse(account.name_mismatch_acknowledged)
+        self.assertIsNotNone(account.name_verification_at)
+
+    def test_setup_requires_and_records_acknowledged_alternative_payout_name(self):
+        with patch.object(main_module, "_student_from_authorization", return_value=self.student):
+            with self.assertRaises(HTTPException) as missing_acknowledgment:
+                asyncio.run(main_module.setup_seller_payout_account(
+                    self.payload(account_name="Authorized Family Member"),
+                    authorization="test-token",
+                    db=self.db,
+                ))
+        self.assertEqual(missing_acknowledgment.exception.status_code, 400)
+        self.assertEqual(self.db.query(SellerPaymentAccount).count(), 0)
+
+        banks = AsyncMock(return_value=[{
+            "code": self.provider.code,
+            "name": self.provider.name,
+            "method": "bank",
+        }])
+        create_subaccount = AsyncMock(return_value="chapa-test-subaccount")
+        encryption_key = Fernet.generate_key().decode("ascii")
+        with patch.object(main_module, "_student_from_authorization", return_value=self.student), \
+                patch.object(main_module, "get_chapa_banks", banks), \
+                patch.object(main_module, "_create_chapa_subaccount", create_subaccount), \
+                patch.dict(os.environ, {
+                    "PAYOUT_ACCOUNT_ENCRYPTION_KEY": encryption_key,
+                    "CHAPA_TEST_SECRET_KEY": "test-secret",
+                }):
+            result = asyncio.run(main_module.setup_seller_payout_account(
+                self.payload(
+                    account_name="Authorized Family Member",
+                    name_mismatch_acknowledged=True,
+                ),
+                authorization="test-token",
+                db=self.db,
+            ))
+
+        account = self.db.query(SellerPaymentAccount).one()
+        self.assertEqual(account.profile_name, self.student.name)
+        self.assertEqual(account.account_name, "Authorized Family Member")
+        self.assertEqual(account.payout_account_name, "Authorized Family Member")
+        self.assertTrue(account.name_mismatch_acknowledged)
+        self.assertIsNotNone(account.name_verification_at)
+        self.assertEqual(result["account"]["profile_name"], self.student.name)
+        self.assertTrue(result["account"]["name_mismatch_acknowledged"])
+        self.assertIsNotNone(result["account"]["name_verification_at"])
+        audit_entry = self.db.query(AuditLog).filter_by(
+            action="Alternative Payout Account Acknowledged",
+        ).one()
+        self.assertEqual(audit_entry.entity_id, account.id)
+
+        admin_users = main_module.get_admin_users(db=self.db)
+        seller_row = next(row for row in admin_users if row["student_id"] == self.student.student_id)
+        self.assertTrue(seller_row["family_alternative_payout_account"])
+
+    def test_setup_resolves_mobile_wallet_name_and_cleans_phone_number(self):
+        payload = main_module.SellerPayoutSetupRequest(
+            payout_type="mobile_wallet",
+            bank_code="telebirr",
+            provider_name="Telebirr",
+            account_number="096-271-4305",
+            account_name=self.student.name,
+        )
+        banks = AsyncMock(return_value=[{
+            "code": "855",
+            "name": "telebirr",
+            "method": "mobile_wallet",
+        }])
+        create_subaccount = AsyncMock(return_value="chapa-test-subaccount")
+        encryption_key = Fernet.generate_key().decode("ascii")
+        with patch.object(main_module, "_student_from_authorization", return_value=self.student), \
+                patch.object(main_module, "get_chapa_banks", banks), \
+                patch.object(main_module, "_create_chapa_subaccount", create_subaccount), \
+                patch.dict(os.environ, {
+                    "PAYOUT_ACCOUNT_ENCRYPTION_KEY": encryption_key,
+                    "CHAPA_TEST_SECRET_KEY": "test-secret",
+                }):
+            asyncio.run(main_module.setup_seller_payout_account(
+                payload, authorization="test-token", db=self.db
+            ))
+
+        chapa_payload = create_subaccount.await_args.args[1]
+        self.assertEqual(chapa_payload["bank_code"], "855")
+        self.assertEqual(chapa_payload["account_number"], "0962714305")
+        account = self.db.query(SellerPaymentAccount).one()
+        self.assertEqual(account.bank_code, "855")
+        self.assertEqual(account.account_last4, "4305")
+
+    def test_legacy_mobile_wallet_provider_code_resolves_to_seeded_provider(self):
+        payload = main_module.SellerPayoutSetupRequest(
+            payout_type="mobile_wallet",
+            bank_code="telebirr",
+            account_name=self.student.name,
+        )
+
+        provider = main_module._resolve_selected_provider(self.db, payload)
+
+        self.assertEqual(provider.code, "855")
+        self.assertEqual(provider.type, "mobile_wallet")
 
     def test_setup_endpoint_limits_repeated_attempts(self):
         invalid_payload = main_module.SellerPayoutSetupRequest(
@@ -201,6 +371,54 @@ class SellerPayoutAccountTests(unittest.TestCase):
                 ))
         self.assertEqual(error.exception.status_code, 401)
         self.assertEqual(self.db.query(SellerPaymentAccountHistory).count(), 0)
+
+    def test_edit_requires_and_persists_alternative_name_acknowledgment(self):
+        account = self.create_account(chapa_sub_account_id="chapa-test-subaccount")
+        alternative_name_payload = self.payload(
+            account_name="Authorized Family Member",
+        )
+        with patch.object(main_module, "_student_from_authorization", return_value=self.student):
+            with self.assertRaises(HTTPException) as missing_acknowledgment:
+                asyncio.run(main_module.update_seller_payout_account(
+                    alternative_name_payload,
+                    request=self.request("payout-test-password"),
+                    authorization="test-token",
+                    db=self.db,
+                ))
+        self.assertEqual(missing_acknowledgment.exception.status_code, 400)
+        self.assertEqual(account.account_name, "Payout Seller")
+
+        banks = AsyncMock(return_value=[{
+            "code": self.provider.code,
+            "name": self.provider.name,
+            "method": "bank",
+        }])
+        create_subaccount = AsyncMock(return_value="replacement-chapa-subaccount")
+        encryption_key = Fernet.generate_key().decode("ascii")
+        with patch.object(main_module, "_student_from_authorization", return_value=self.student), \
+                patch.object(main_module, "get_chapa_banks", banks), \
+                patch.object(main_module, "_create_chapa_subaccount", create_subaccount), \
+                patch.dict(os.environ, {
+                    "CHAPA_MODE": "test",
+                    "CHAPA_TEST_SECRET_KEY": "test-secret",
+                    "PAYOUT_ACCOUNT_ENCRYPTION_KEY": encryption_key,
+                }):
+            asyncio.run(main_module.update_seller_payout_account(
+                self.payload(
+                    account_name="Authorized Family Member",
+                    name_mismatch_acknowledged=True,
+                ),
+                request=self.request("payout-test-password"),
+                authorization="test-token",
+                db=self.db,
+            ))
+
+        self.db.refresh(account)
+        self.assertEqual(account.profile_name, self.student.name)
+        self.assertEqual(account.payout_account_name, "Authorized Family Member")
+        self.assertTrue(account.name_mismatch_acknowledged)
+        self.assertIsNotNone(account.name_verification_at)
+        self.assertEqual(self.db.query(SellerPaymentAccountHistory).count(), 1)
 
     def test_chapa_update_failure_leaves_account_and_history_unchanged(self):
         account = self.create_account(chapa_sub_account_id="chapa-test-subaccount")
@@ -323,8 +541,36 @@ class SellerPayoutAccountTests(unittest.TestCase):
             ))
 
         self.assertEqual(subaccount_id, "chapa-test-subaccount")
+        self.assertEqual(client.request_json["business_name"], "Test Shop")
+        self.assertEqual(client.request_json["account_name"], "Payout Seller")
         self.assertEqual(client.request_json["split_type"], "percentage")
-        self.assertEqual(client.request_json["split_value"], "1.0000")
+        self.assertEqual(client.request_json["split_value"], 0.01)
+        self.assertIsInstance(client.request_json["split_value"], float)
+
+    def test_chapa_subaccount_percentage_converts_three_point_five_percent(self):
+        client = self.make_chapa_client(
+            201,
+            {"status": "success", "data": {"subaccount_id": "chapa-test-subaccount"}},
+        )
+
+        with patch.object(main_module.httpx, "AsyncClient", return_value=client), \
+                patch.object(main_module, "_get_commission_settings", return_value={
+                    "commission_enabled": True,
+                    "commission_type": "percentage",
+                    "commission_rate": "3.5",
+                }):
+            asyncio.run(main_module._create_chapa_subaccount(
+                self.db,
+                {
+                    "business_name": "Test Shop",
+                    "bank_code": self.provider.code,
+                    "account_number": "1234567890123",
+                    "account_name": "Payout Seller",
+                },
+                "test-secret",
+            ))
+
+        self.assertEqual(client.request_json["split_value"], 0.035)
 
     def test_chapa_validation_error_returns_422_and_keeps_database_unchanged(self):
         account = self.create_account(chapa_sub_account_id="chapa-test-subaccount")
@@ -348,6 +594,8 @@ class SellerPayoutAccountTests(unittest.TestCase):
         self.assertIn("method=POST", diagnostic)
         self.assertIn("path=/v1/subaccount", diagnostic)
         self.assertIn("status=422", diagnostic)
+        self.assertIn("response_text=", diagnostic)
+        self.assertIn("Invalid account number", diagnostic)
         self.assertIn("validation_fields=['account_number']", diagnostic)
         self.assertNotIn("9876543210123", diagnostic)
         self.assertNotIn("test-secret", diagnostic)

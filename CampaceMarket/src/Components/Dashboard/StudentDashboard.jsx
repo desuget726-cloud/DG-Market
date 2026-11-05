@@ -19,9 +19,11 @@ import { shouldReduceUnreadNotificationCount } from '../../utils/notificationSta
 import { buildOrderDashboardUrl, parseOrderDashboardLink } from '../../utils/orderDashboardLink';
 import { filterPublicProducts } from '../../utils/publicListings';
 import {
+  getEssentialPayoutProviders,
   getPayoutSetupStateAfterMethodChange,
   isPayoutSetupValid,
   isValidPayoutAccountNumber,
+  payoutNameNeedsAcknowledgement,
 } from '../../utils/payoutSetupValidation';
 
 const isVerifiedStudent = (student) => [true, 1, '1', 'true'].includes(student?.is_verified);
@@ -569,6 +571,7 @@ function StudentDashboard({
   const [payoutSetupType, setPayoutSetupType] = useState('bank');
   const [payoutSetupBankCode, setPayoutSetupBankCode] = useState('');
   const [payoutSetupAccountName, setPayoutSetupAccountName] = useState(user?.name || '');
+  const [payoutSetupNameMismatchAcknowledged, setPayoutSetupNameMismatchAcknowledged] = useState(false);
   const [payoutSetupAccountNumber, setPayoutSetupAccountNumber] = useState('');
   const [withdrawProviderUnavailable, setWithdrawProviderUnavailable] = useState(false);
   const [activeWithdrawal, setActiveWithdrawal] = useState(null);
@@ -3362,14 +3365,19 @@ function StudentDashboard({
     return () => controller.abort();
   }, [payoutAccount, payoutSetupBanks.length, payoutSetupOpen, payoutSetupRetryCount, showWithdrawModal, t]);
 
-  const visiblePayoutSetupProviders = payoutSetupBanks.filter((bank) => bank.method === payoutSetupType);
+  const visiblePayoutSetupProviders = getEssentialPayoutProviders(payoutSetupBanks, payoutSetupType);
+  const payoutSetupNameNeedsAcknowledgement = payoutNameNeedsAcknowledgement(
+    payoutSetupAccountName,
+    user?.full_name || user?.fullName || user?.name,
+  );
   const payoutSetupValid = visiblePayoutSetupProviders.some((bank) => bank.code === payoutSetupBankCode)
     && isPayoutSetupValid({
       payoutType: payoutSetupType,
       providerCode: payoutSetupBankCode,
       holderName: payoutSetupAccountName,
-      expectedHolderName: user?.name,
+      expectedHolderName: user?.full_name || user?.fullName || user?.name,
       accountNumber: payoutSetupAccountNumber,
+      nameMismatchAcknowledged: payoutSetupNameMismatchAcknowledged,
     });
 
   const handlePayoutSetupSubmit = async () => {
@@ -3381,7 +3389,18 @@ function StudentDashboard({
       const token = getStudentSessionToken();
       if (!token) throw new Error(t('walletPayout.authRequired'));
       if (!verifiedStudent) throw new Error(t('walletPayout.verifiedRequired'));
-      if (!payoutSetupBankCode || !payoutSetupAccountName.trim() || !payoutSetupAccountNumber.trim()) {
+      const registeredName = String(user?.full_name || user?.fullName || user?.name || '').trim();
+      const businessName = String(
+        user?.business_name
+        || user?.businessName
+        || user?.shop_name
+        || user?.shopName
+        || user?.store_name
+        || user?.storeName
+        || registeredName,
+      ).trim();
+      const accountName = payoutSetupAccountName.trim() || registeredName;
+      if (!payoutSetupBankCode || !accountName || !payoutSetupAccountNumber.trim()) {
         throw new Error(t('walletPayout.setupFieldsRequired'));
       }
       if (!isValidPayoutAccountNumber(payoutSetupType, payoutSetupBankCode, payoutSetupAccountNumber)) {
@@ -3397,10 +3416,12 @@ function StudentDashboard({
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
+          business_name: businessName,
           payout_type: payoutSetupType,
           bank_code: payoutSetupBankCode,
-          account_name: payoutSetupAccountName.trim(),
+          account_name: accountName,
           account_number: payoutSetupAccountNumber.trim(),
+          name_mismatch_acknowledged: payoutSetupNameNeedsAcknowledgement && payoutSetupNameMismatchAcknowledged,
         }),
       });
       const data = await response.json().catch(() => ({}));
@@ -6967,14 +6988,29 @@ function StudentDashboard({
                       {t('walletPayout.holderName')}
                       <input
                         value={payoutSetupAccountName}
-                        onChange={(event) => setPayoutSetupAccountName(event.target.value)}
+                        onChange={(event) => {
+                          setPayoutSetupAccountName(event.target.value);
+                          setPayoutSetupNameMismatchAcknowledged(false);
+                        }}
                         autoComplete="name"
                         disabled={payoutSetupLoading}
                         className="mt-1 block w-full rounded-xl border border-slate-200 bg-white px-3 py-2 font-normal"
                       />
                     </label>
+                    {payoutSetupNameNeedsAcknowledgement && (
+                      <label className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm leading-5 text-amber-900">
+                        <input
+                          type="checkbox"
+                          checked={payoutSetupNameMismatchAcknowledged}
+                          onChange={(event) => setPayoutSetupNameMismatchAcknowledged(event.target.checked)}
+                          disabled={payoutSetupLoading}
+                          className="mt-1 h-4 w-4 shrink-0 accent-amber-700"
+                        />
+                        <span>{t('walletPayout.alternativeNameConsent')}</span>
+                      </label>
+                    )}
                     <label className="block text-sm font-semibold text-slate-700">
-                      {payoutSetupType === 'mobile_wallet' ? t('walletPayout.mobileNumber') : t('walletPayout.accountNumber')}
+                      {payoutSetupType === 'mobile_wallet' ? 'Telebirr / CBE Birr Phone Number' : 'CBE Account Number'}
                       <input
                         value={payoutSetupAccountNumber}
                         onChange={(event) => setPayoutSetupAccountNumber(event.target.value.replace(/\D/g, ''))}
@@ -6983,6 +7019,7 @@ function StudentDashboard({
                         pattern={payoutSetupType === 'mobile_wallet' ? '(09|07)[0-9]{8}' : undefined}
                         minLength={payoutSetupType === 'mobile_wallet' ? 10 : 10}
                         maxLength={payoutSetupType === 'mobile_wallet' ? 10 : 15}
+                        placeholder={payoutSetupType === 'mobile_wallet' ? 'Enter phone number (e.g. 0912345678)' : 'Enter CBE account number (e.g. 1000...)'}
                         autoComplete="off"
                         disabled={payoutSetupLoading}
                         className="mt-1 block w-full rounded-xl border border-slate-200 bg-white px-3 py-2 font-normal"
@@ -6995,10 +7032,6 @@ function StudentDashboard({
                           : t('walletPayout.accountNumberInvalid')}
                       </p>
                     )}
-                    {payoutSetupAccountName.trim() && user?.name
-                      && payoutSetupAccountName.trim().replace(/\s+/g, ' ').toLowerCase()
-                      !== user.name.trim().replace(/\s+/g, ' ').toLowerCase()
-                      && <p className="text-sm text-red-700">{t('walletPayout.holderNameInvalid')}</p>}
                   </section>
                 )}
 

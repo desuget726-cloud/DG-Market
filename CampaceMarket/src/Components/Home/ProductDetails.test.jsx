@@ -413,7 +413,14 @@ describe('ProductDetails guest actions', () => {
     render(<ProductDetails product={product} currentUser={{ studentId: 'buyer-1' }} />);
 
     fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with Chapa' }))[0]);
-    fireEvent.click(await screen.findByRole('button', { name: 'Continue to Chapa · 1000.00 ETB' }));
+    const telebirrOption = screen.getByRole('button', { name: 'Telebirr' });
+    expect(telebirrOption.getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('button', { name: 'Pay 1,000.00 ETB via Telebirr' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'CBE Birr' }));
+    expect(screen.getByRole('button', { name: 'Pay 1,000.00 ETB via CBE Birr' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'CBE Bank' }));
+    expect(screen.getByRole('button', { name: 'CBE Bank' }).getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(await screen.findByRole('button', { name: 'Pay 1,000.00 ETB via CBE Bank' }));
 
     expect((await screen.findByRole('alert')).textContent).toContain('Seller must complete payout setup.');
     expect(screen.getByRole('heading', { name: 'Pay with Chapa' })).toBeTruthy();
@@ -456,19 +463,27 @@ describe('ProductDetails guest actions', () => {
       currentUser={{ studentId: 'buyer-1', is_verified: true, access_token: 'student-token' }}
     />);
 
-    expect(screen.getByText('Make sure you have inspected the product in person before completing the payment.')).toBeTruthy();
+    expect(screen.getByText('Campus Handover: Inspect item before completing payment.')).toBeTruthy();
     fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with Chapa' }))[0]);
     expect(await screen.findByRole('heading', { name: 'Pay with Chapa' })).toBeTruthy();
-    expect(screen.getAllByText('Make sure you have inspected the product in person before completing the payment.')).toHaveLength(2);
+    expect(screen.getByText('Supported Payment Methods')).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'Telebirr logo' })).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'CBE Birr logo' })).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'CBE logo' })).toBeTruthy();
+    expect(screen.getAllByText('Campus Handover: Inspect item before completing payment.')).toHaveLength(2);
     expect(screen.getByText('10.00 ETB')).toBeTruthy();
-    fireEvent.click(await screen.findByRole('button', { name: 'Continue to Chapa · 1000.00 ETB' }));
+    fireEvent.click(screen.getByRole('button', { name: 'CBE Bank' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pay 1,000.00 ETB via CBE Bank' }));
 
     await waitFor(() => expect(checkoutWindow.location.href).toBe('https://checkout.chapa.test/tx'));
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/wallet/set-pin'))).toBe(false);
     expect(mockMarkCheckoutComplete).not.toHaveBeenCalled();
     const paymentRequest = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/products/42/checkout'));
     expect(paymentRequest[1].method).toBe('POST');
-    expect(JSON.parse(paymentRequest[1].body)).toEqual({ quantity: 1 });
+    expect(JSON.parse(paymentRequest[1].body)).toEqual({
+      quantity: 1,
+      payment_method: 'cbe_bank',
+    });
   });
 
   it('does not expose wallet PIN recovery in product checkout', async () => {
