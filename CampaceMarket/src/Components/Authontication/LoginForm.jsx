@@ -9,6 +9,32 @@ import { notifyInfo } from '../../utils/notify';
 import logs from '../../assets/logs.png';
 import './LoginForm.css';
 
+function getOAuthSessionToken(callbackUrl) {
+  const fragment = new URLSearchParams(callbackUrl.hash.slice(1));
+  const callbackToken = callbackUrl.searchParams.get('access_token')
+    || callbackUrl.searchParams.get('token')
+    || fragment.get('access_token')
+    || fragment.get('token');
+  if (callbackToken) return callbackToken;
+
+  try {
+    const directToken = window.localStorage.getItem('token');
+    if (directToken) return directToken;
+    const savedSession = JSON.parse(window.localStorage.getItem('campaceSession') || 'null');
+    const savedUser = savedSession?.user;
+    return savedUser?.access_token
+      || savedUser?.accessToken
+      || savedUser?.token
+      || savedSession?.access_token
+      || savedSession?.accessToken
+      || savedSession?.token
+      || '';
+  } catch (storageError) {
+    console.error('Unable to read the saved OAuth session token:', storageError);
+    return '';
+  }
+}
+
 function LoginForm({ onLoginSuccess, onToggleRegister, onCancel, sessionExpiredMessage = '' }) {
   const { t } = useLanguage();
   const [formData, setFormData] = useState({ studentId: '', password: '' });
@@ -71,9 +97,19 @@ function LoginForm({ onLoginSuccess, onToggleRegister, onCancel, sessionExpiredM
     }
 
     if (callbackUrl.searchParams.get('oauth') === 'success') {
+      const sessionToken = getOAuthSessionToken(callbackUrl);
       callbackUrl.searchParams.delete('oauth');
+      callbackUrl.searchParams.delete('access_token');
+      callbackUrl.searchParams.delete('token');
+      if (new URLSearchParams(callbackUrl.hash.slice(1)).has('access_token')
+        || new URLSearchParams(callbackUrl.hash.slice(1)).has('token')) {
+        callbackUrl.hash = '';
+      }
       window.history.replaceState({}, document.title, `${callbackUrl.pathname}${callbackUrl.search}${callbackUrl.hash}`);
-      fetch(apiUrl('/api/auth/session'), { credentials: 'include' })
+      fetch(apiUrl('/api/auth/session'), {
+        credentials: 'include',
+        ...(sessionToken ? { headers: { Authorization: `Bearer ${sessionToken}` } } : {}),
+      })
         .then(async (response) => {
           if (!response.ok) throw new Error(t('auth.oauthErrors.session_restore_failed'));
           const data = await response.json();

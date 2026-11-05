@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { API_BASE_URL } from '../config';
 
 const ORDER_QUERY_KEYS = {
@@ -36,6 +36,7 @@ export function useSellerOrders({ token, enabled = true } = {}) {
   const [pageData, setPageData] = useState({ items: [], total: 0, page: 1, page_size: 10 });
   const [loading, setLoading] = useState(false);
   const [hasLoaded, setHasLoaded] = useState(false);
+  const hasLoadedRef = useRef(false);
   const [error, setError] = useState('');
   const [retryCount, setRetryCount] = useState(0);
 
@@ -67,7 +68,7 @@ export function useSellerOrders({ token, enabled = true } = {}) {
     Promise.resolve()
       .then(() => {
         if (controller.signal.aborted) return null;
-        setLoading(true);
+        if (!hasLoadedRef.current) setLoading(true);
         setError('');
         return fetch(`${API_BASE_URL}/api/seller/orders?${query.toString()}`, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -84,12 +85,14 @@ export function useSellerOrders({ token, enabled = true } = {}) {
         if (result) {
           setPageData(result);
           setHasLoaded(true);
+          hasLoadedRef.current = true;
         }
       })
       .catch((requestError) => {
         if (requestError.name !== 'AbortError') {
           setError(requestError.message || 'Unable to load completed orders.');
           setHasLoaded(true);
+          hasLoadedRef.current = true;
         }
       })
       .finally(() => {
@@ -98,6 +101,21 @@ export function useSellerOrders({ token, enabled = true } = {}) {
 
     return () => controller.abort();
   }, [enabled, filters, pageData.page_size, retryCount, token]);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const refresh = () => {
+      if (document.visibilityState === 'visible') setRetryCount((count) => count + 1);
+    };
+    const pollId = window.setInterval(refresh, 5000);
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.clearInterval(pollId);
+      window.removeEventListener('focus', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [enabled]);
 
   const retry = useCallback(() => setRetryCount((count) => count + 1), []);
 

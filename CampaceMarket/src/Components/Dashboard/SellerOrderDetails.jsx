@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { IMAGE_PLACEHOLDER, resolveImageUrl, SHOW_REPORT_PROBLEM } from '../../config';
+import { API_BASE_URL, IMAGE_PLACEHOLDER, resolveImageUrl, SHOW_REPORT_PROBLEM } from '../../config';
 import { useLanguage } from '../../context/LanguageContext';
+import { buildPaymentReceiptPdf, paymentReceiptPdfFilename } from '../../utils/paymentReceiptPdf';
 
 const formatEtb = (value, language) => (
   `${Number(value || 0).toLocaleString(language === 'am' ? 'am-ET' : 'en-ET')} ETB`
@@ -31,6 +32,7 @@ function SellerOrderDetails({
   onBack,
   onDisputeResponse,
   onOpenChat,
+  sessionToken,
 }) {
   const { t, language } = useLanguage();
   const [activeImage, setActiveImage] = useState(0);
@@ -39,6 +41,9 @@ function SellerOrderDetails({
   const [evidenceFiles, setEvidenceFiles] = useState([]);
   const [responseError, setResponseError] = useState('');
   const [submittingResponse, setSubmittingResponse] = useState(false);
+  const [paymentReceipt, setPaymentReceipt] = useState(null);
+  const [paymentReceiptLoading, setPaymentReceiptLoading] = useState(false);
+  const [paymentReceiptError, setPaymentReceiptError] = useState('');
   const [now, setNow] = useState(null);
   const unavailable = t('sellerOrders.unavailable');
 
@@ -101,6 +106,8 @@ function SellerOrderDetails({
   const payment = order.payment || {};
   const buyer = order.buyer || {};
   const timeline = order.timeline || {};
+  const paymentSettled = ['successful', 'success', 'paid', 'completed']
+    .includes(String(payment.payment_status || '').trim().toLowerCase());
   const images = Array.isArray(product.images) && product.images.length ? product.images : [IMAGE_PLACEHOLDER];
   const dispute = order.dispute;
   const responseRemaining = dispute?.response_deadline
@@ -109,6 +116,30 @@ function SellerOrderDetails({
   const reportWindowRemaining = order.report_window_ends_at
     ? formatTimeRemaining(order.report_window_ends_at, now || 0, language)
     : '';
+  const fetchPaymentReceipt = async () => {
+    if (paymentReceipt) return paymentReceipt;
+    setPaymentReceiptLoading(true);
+    setPaymentReceiptError('');
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/student/orders/${encodeURIComponent(order.id)}/receipt`,
+        { headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {} },
+      );
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || 'Unable to load the payment receipt.');
+      setPaymentReceipt(result);
+      return result;
+    } catch (receiptError) {
+      setPaymentReceiptError(receiptError.message || 'Unable to load the payment receipt.');
+      throw receiptError;
+    } finally {
+      setPaymentReceiptLoading(false);
+    }
+  };
+  const downloadPaymentReceipt = async () => {
+    const receipt = await fetchPaymentReceipt();
+    buildPaymentReceiptPdf(receipt).save(paymentReceiptPdfFilename(receipt.order_number));
+  };
 
   const timelineEvents = [
     ['orderCreated', timeline.order_created_at],
@@ -134,8 +165,16 @@ function SellerOrderDetails({
           </p>
           <h1 className="mt-2 text-2xl font-black text-slate-950">#{order.id}</h1>
         </div>
-        <span className="rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-bold text-emerald-700">
-          {t('sellerOrders.sold')}
+        <span
+          role="status"
+          aria-live="polite"
+          className={`rounded-full border px-4 py-2 text-sm font-bold ${
+            paymentSettled
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+              : 'border-amber-200 bg-amber-50 text-amber-900'
+          }`}
+        >
+          {paymentSettled ? 'Payment Received / Order Settled' : 'Payment not confirmed'}
         </span>
       </header>
 
@@ -194,6 +233,13 @@ function SellerOrderDetails({
         <div className="space-y-5">
           <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
             <h2 className="text-xl font-black text-slate-950">{t('sellerOrders.payment')}</h2>
+            <div className={`mt-4 rounded-2xl p-3 text-sm font-bold ${
+              paymentSettled ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-900'
+            }`}>
+              {paymentSettled
+                ? 'Payment received. The order is settled and ready for handover.'
+                : 'Do not hand over the item until payment is confirmed.'}
+            </div>
             <dl className="mt-4 space-y-3 text-sm">
               {[
                 [t('sellerOrders.itemPrice'), formatEtb(payment.item_price, language)],
@@ -208,6 +254,40 @@ function SellerOrderDetails({
                 </div>
               ))}
             </dl>
+            {paymentSettled && (
+              <div className="mt-5 space-y-3 border-t border-slate-100 pt-4">
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => fetchPaymentReceipt().catch(() => {})}
+                    disabled={paymentReceiptLoading}
+                    className="rounded-full bg-slate-900 px-4 py-2.5 text-xs font-black text-white hover:bg-slate-700 disabled:opacity-60"
+                  >
+                    {paymentReceiptLoading ? 'Loading receipt…' : 'View official receipt'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => downloadPaymentReceipt().catch((receiptError) => {
+                      setPaymentReceiptError(receiptError.message || 'Unable to download the payment receipt.');
+                    })}
+                    disabled={paymentReceiptLoading}
+                    className="rounded-full border border-slate-300 px-4 py-2.5 text-xs font-black text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                  >
+                    Download receipt
+                  </button>
+                </div>
+                {paymentReceiptError && <p role="alert" className="rounded-xl bg-rose-50 p-3 text-sm font-semibold text-rose-700">{paymentReceiptError}</p>}
+                {paymentReceipt && (
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700">
+                    <p className="font-black uppercase tracking-wide text-emerald-800">Official payment receipt · {paymentReceipt.receipt_number}</p>
+                    <p className="mt-2">Order #{paymentReceipt.order_number} · {paymentReceipt.product_name}</p>
+                    <p className="mt-1">Total paid: <strong>{formatEtb(paymentReceipt.total_paid, language)}</strong></p>
+                    <p className="mt-1 break-all">Reference: {paymentReceipt.transaction_reference}</p>
+                    <p className="mt-2">{paymentReceipt.payment_message}</p>
+                  </div>
+                )}
+              </div>
+            )}
           </section>
 
           <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm sm:p-7">

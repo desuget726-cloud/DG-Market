@@ -1,10 +1,12 @@
 # Campace Market
 
-## Wallet payments at handover
+## Product checkout and wallet deposits
 
-Orders are created only when a buyer pays the seller from their wallet at handover. Chapa is used for wallet top-ups only; a successful wallet payment credits the seller and immediately completes the order.
+Product purchases use Chapa checkout with a split-payment subaccount for the seller. The seller must finish payout setup and have an active Chapa subaccount before buyers can check out. The checkout records a pending order and reserves the requested inventory; the signed webhook or server-side Chapa verification completes the order. The seller's internal marketplace wallet is not credited because Chapa settles the split directly.
 
-The frontend creates and reuses one idempotency key for each product-and-quantity payment intent. It keeps that key when the request outcome is uncertain, and only discards it after a definitive response or when the buyer changes the intent. Retrying with the same key returns the original order without moving money again; using a different key represents a separate payment attempt.
+Percentage commission is passed to Chapa as a fraction (`0.0100` for 1%). Cart totals show the item subtotal, while the platform commission is displayed separately as a deduction from the seller payout. Chapa's documented initialization fields do not provide a confirmed way to assign its processing fees to the seller; seller-borne gateway fees are therefore not guaranteed and must be confirmed with Chapa before relying on that accounting.
+
+The frontend creates and reuses one idempotency key for each product-and-quantity checkout intent. It keeps that key when the request outcome is uncertain and discards it after a definitive response or when the buyer changes the intent. Wallet deposits remain available through their separate Chapa initialization flow and continue to credit the student's wallet.
 
 ## Google OAuth setup
 

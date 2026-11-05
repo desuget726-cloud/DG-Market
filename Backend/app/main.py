@@ -475,6 +475,7 @@ origins = list(dict.fromkeys(origins))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1041,8 +1042,239 @@ def _settle_verified_chapa_transaction(
         raise HTTPException(status_code=500, detail="Unable to settle payment safely.")
 
 
+def _settle_verified_chapa_product_order(
+    db: Session,
+    tx_ref: str,
+    expected_amount: Optional[Decimal] = None,
+) -> Dict[str, Any]:
+    """Complete a Chapa split order without crediting the seller's wallet."""
+    db.rollback()
+    try:
+        with db.begin():
+            transaction = (
+                db.query(Transaction)
+                .filter(Transaction.tx_id == tx_ref)
+                .with_for_update()
+                .first()
+            )
+            if not transaction or _normalize_payment_type(transaction.type) != "Product Purchase":
+                raise HTTPException(status_code=404, detail="Product payment transaction not found.")
+
+            payment_record = (
+                db.query(PaymentIdempotency)
+                .filter(PaymentIdempotency.transaction_id == tx_ref)
+                .with_for_update()
+                .first()
+            )
+            if not payment_record or not payment_record.order_id:
+                raise HTTPException(status_code=404, detail="Order not found for product payment.")
+            if payment_record.buyer_id != transaction.student_id:
+                raise HTTPException(status_code=409, detail="Product payment reference does not match its buyer.")
+
+            order = (
+                db.query(Order)
+                .filter(Order.id == payment_record.order_id)
+                .with_for_update()
+                .first()
+            )
+            if not order or order.student_id != transaction.student_id:
+                raise HTTPException(status_code=404, detail="Order not found for product payment.")
+
+            amount = Decimal(str(transaction.amount)).quantize(Decimal("0.01"))
+            order_amount = (
+                Decimal(str(order.price)) * Decimal(int(order.quantity or 1))
+            ).quantize(Decimal("0.01"))
+            if amount <= 0 or amount != order_amount:
+                raise HTTPException(status_code=400, detail="Product payment amount does not match the order.")
+            if expected_amount is not None and amount != expected_amount.quantize(Decimal("0.01")):
+                raise HTTPException(status_code=400, detail="Chapa payment amount does not match the order.")
+
+            if (
+                _normalize_payment_status(transaction.status) == "Successful"
+                and _normalize_payment_status(order.payment_status) == "Successful"
+            ):
+                return {
+                    "transaction_id": transaction.tx_id,
+                    "student_id": transaction.student_id,
+                    "order_id": order.id,
+                    "amount": amount,
+                    "commission": Decimal(str(order.seller_commission or 0)).quantize(Decimal("0.01")),
+                    "already_settled": True,
+                }
+            if _normalize_payment_status(transaction.status) != "Pending":
+                raise HTTPException(status_code=409, detail="Product payment is no longer pending.")
+
+            commission = Decimal(str(order.seller_commission or 0)).quantize(Decimal("0.01"))
+            if commission < 0 or commission > amount:
+                raise HTTPException(status_code=409, detail="Order commission is invalid.")
+
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            transaction.status = "Successful"
+            transaction.description = f"Chapa split payment for order #{order.id}"
+            order.status = "Completed"
+            order.payment_status = "Successful"
+            order.paid_at = now
+            order.completed_at = now
+            order.expired_at = None
+            order.is_funds_released = True
+            cart_item = (
+                db.query(CartItem)
+                .filter(
+                    CartItem.student_id == order.student_id,
+                    CartItem.product_id == order.product_id,
+                )
+                .with_for_update()
+                .first()
+            )
+            if cart_item:
+                cart_quantity = int(cart_item.quantity or 1)
+                purchased_quantity = int(order.quantity or 1)
+                if cart_quantity <= purchased_quantity:
+                    db.delete(cart_item)
+                else:
+                    cart_item.quantity = cart_quantity - purchased_quantity
+
+            if commission:
+                system_wallet = (
+                    db.query(SystemSetting)
+                    .filter(SystemSetting.key == "system_wallet_balance")
+                    .with_for_update()
+                    .first()
+                )
+                if system_wallet:
+                    balance = Decimal(str(system_wallet.value or 0)).quantize(Decimal("0.01"))
+                    system_wallet.value = str((balance + commission).quantize(Decimal("0.01")))
+                else:
+                    db.add(SystemSetting(
+                        key="system_wallet_balance",
+                        value=str(commission),
+                    ))
+
+            db.add(AuditLog(
+                admin_id=None,
+                action="payment_completed",
+                entity_type="Order",
+                entity_id=order.id,
+                description=(
+                    f"Chapa split payment {tx_ref} completed for order #{order.id}; "
+                    f"platform commission {commission} ETB."
+                ),
+                status="SUCCESS",
+                ip_address="127.0.0.1",
+            ))
+            buyer = db.query(Student).filter(Student.student_id == order.student_id).first()
+            seller = db.query(Student).filter(Student.student_id == order.seller_id).first()
+            order_target = json.dumps({"kind": "order", "order_id": order.id})
+            if buyer:
+                _add_student_notification(
+                    db,
+                    buyer,
+                    "Payment completed",
+                    f"Your Chapa payment for '{order.title}' is complete.",
+                    "payment",
+                    order_target,
+                    reference_id=str(order.id),
+                    action_label="View Order",
+                    action_url=f"/dashboard?tab=buyer&section=orders&order={order.id}",
+                )
+            if seller:
+                _add_student_notification(
+                    db,
+                    seller,
+                    "Payment received",
+                    f"Chapa confirmed payment for '{order.title}'. You can arrange handover.",
+                    "payment",
+                    order_target,
+                    reference_id=str(order.id),
+                    action_label="View Order",
+                    action_url=f"/dashboard?tab=seller&section=orders&order={order.id}",
+                )
+            return {
+                "transaction_id": transaction.tx_id,
+                "student_id": transaction.student_id,
+                "order_id": order.id,
+                "seller_id": order.seller_id,
+                "amount": amount,
+                "commission": commission,
+                "already_settled": False,
+            }
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        logging.getLogger("app.payments").exception(
+            "Unable to settle Chapa split order for transaction %s safely.",
+            tx_ref,
+        )
+        raise HTTPException(status_code=500, detail="Unable to settle product payment safely.")
+
+
+def _release_pending_chapa_product_order(db: Session, tx_ref: str, *, expired: bool) -> bool:
+    """Release inventory once when a pending Chapa product payment fails or expires."""
+    db.rollback()
+    try:
+        with db.begin():
+            transaction = (
+                db.query(Transaction)
+                .filter(Transaction.tx_id == tx_ref)
+                .with_for_update()
+                .first()
+            )
+            if not transaction or _normalize_payment_type(transaction.type) != "Product Purchase":
+                return False
+            if _normalize_payment_status(transaction.status) != "Pending":
+                return False
+
+            payment_record = (
+                db.query(PaymentIdempotency)
+                .filter(PaymentIdempotency.transaction_id == tx_ref)
+                .with_for_update()
+                .first()
+            )
+            order = (
+                db.query(Order)
+                .filter(Order.id == payment_record.order_id)
+                .with_for_update()
+                .first()
+                if payment_record and payment_record.order_id
+                else None
+            )
+            if not order or _normalize_payment_status(order.payment_status) != "Pending":
+                return False
+
+            product = (
+                db.query(Product)
+                .filter(Product.id == order.product_id)
+                .with_for_update()
+                .first()
+            )
+            if product:
+                product.stock = int(product.stock or 0) + int(order.quantity or 1)
+                _sync_product_status_with_stock(product)
+
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            order.status = "Expired" if expired else "Cancelled"
+            order.payment_status = "Failed"
+            order.expired_at = now if expired else order.expired_at
+            transaction.status = "Failed"
+            transaction.description = (
+                f"Chapa checkout expired for order #{order.id}"
+                if expired
+                else f"Chapa checkout initialization failed for order #{order.id}"
+            )
+            return True
+    except SQLAlchemyError:
+        db.rollback()
+        logging.getLogger("app.payments").exception(
+            "Unable to release inventory for Chapa product payment %s.",
+            tx_ref,
+        )
+        raise HTTPException(status_code=500, detail="Unable to release product checkout inventory safely.")
+
+
 async def _reconcile_pending_payments() -> None:
-    """Verify pending Chapa wallet deposits and settle confirmed payments."""
+    """Verify pending Chapa deposits and product orders, settling confirmed payments."""
     try:
         secret = get_chapa_secret_key()
     except PayoutProviderError:
@@ -1126,6 +1358,47 @@ async def _reconcile_pending_payments() -> None:
                 db.rollback()
                 logging.getLogger("app.payments").warning(
                     "Chapa transaction verification did not satisfy settlement requirements for %s.",
+                    pending_transaction.tx_id,
+                )
+
+        pending_product_payments = (
+            db.query(Transaction)
+            .filter(
+                Transaction.status == "Pending",
+                Transaction.type == "Product Purchase",
+            )
+            .all()
+        )
+        for pending_transaction in pending_product_payments:
+            try:
+                verification = _request_chapa_verification(pending_transaction.tx_id)
+                expected_amount = Decimal(str(pending_transaction.amount)).quantize(Decimal("0.01"))
+                if verification["amount"] != expected_amount:
+                    continue
+                if verification["status"] == "Successful":
+                    settlement = _settle_verified_chapa_product_order(
+                        db,
+                        pending_transaction.tx_id,
+                        expected_amount=verification["amount"],
+                    )
+                    continue
+
+                created_at = pending_transaction.created_at
+                pending_age = (
+                    datetime.now(timezone.utc).replace(tzinfo=None) - created_at
+                    if created_at
+                    else timedelta(0)
+                )
+                if verification["status"] in {"Failed", "Expired", "Cancelled"} or pending_age >= timedelta(minutes=60):
+                    _release_pending_chapa_product_order(
+                        db,
+                        pending_transaction.tx_id,
+                        expired=verification["status"] not in {"Failed", "Cancelled"},
+                    )
+            except HTTPException:
+                db.rollback()
+                logging.getLogger("app.payments").warning(
+                    "Unable to reconcile pending Chapa product payment %s.",
                     pending_transaction.tx_id,
                 )
     except SQLAlchemyError:
@@ -2716,6 +2989,12 @@ class ProductPaymentRequest(BaseModel):
         return value
 
 
+class ProductCheckoutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    quantity: int = Field(ge=1, strict=True)
+
+
 class WalletPinSetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2751,6 +3030,8 @@ class SellerOrderListItem(BaseModel):
     product_title: str
     amount: Decimal
     status: str
+    payment_status: str
+    paid_at: Optional[datetime]
     completed_at: Optional[datetime]
 
 
@@ -5796,10 +6077,14 @@ def _consume_google_oauth_state(db: Session, state: Optional[str]) -> Optional[s
 
 
 def _oauth_cookie_secure() -> bool:
+    frontend = urlsplit(_oauth_frontend_url())
+    if frontend.scheme.lower() == "http" and frontend.hostname in {"localhost", "127.0.0.1", "::1"}:
+        return False
+
     configured = os.getenv("COOKIE_SECURE")
     if configured is not None:
         return configured.strip().lower() in {"1", "true", "yes", "on"}
-    return urlsplit(_oauth_frontend_url()).scheme.lower() == "https"
+    return frontend.scheme.lower() == "https"
 
 
 def _create_secure_session_for_student(
@@ -6044,9 +6329,17 @@ async def google_callback(
     location = await resolve_ip_location(
         get_real_client_ip(request) if request else "127.0.0.1"
     )
-    _create_secure_session_for_student(
+    session_data = _create_secure_session_for_student(
         student, response, db, request, location=location
     )
+    redirect_parts = urlsplit(response.headers["location"])
+    response.headers["location"] = urlunsplit((
+        redirect_parts.scheme,
+        redirect_parts.netloc,
+        redirect_parts.path,
+        redirect_parts.query,
+        urlencode({"access_token": session_data["access_token"]}),
+    ))
     return response
 
 
@@ -10032,8 +10325,11 @@ async def _create_chapa_subaccount(
         commission_percent = as_decimal(commission_settings["commission_rate"], field_name="commission_rate")
         if commission_percent < 0 or commission_percent >= 100:
             raise HTTPException(status_code=500, detail="Commission rate must be between 0 and 100 for percentage mode.")
-        commission_fraction = (commission_percent / Decimal("100")).quantize(Decimal("0.0001"))
-        request_payload.update({"split_type": "percentage", "split_value": str(commission_fraction)})
+        if commission_percent > 0:
+            request_payload.update({
+                "split_type": "percentage",
+                "split_value": str(commission_percent.quantize(Decimal("0.0001"))),
+            })
 
     logger = logging.getLogger("app.payments")
     request_fields = sorted(request_payload)
@@ -14887,6 +15183,8 @@ def _seller_order_list_item(order: Order) -> dict:
         "product_title": product_title,
         "amount": item_total,
         "status": _normalize_order_status(order.status or "Completed"),
+        "payment_status": _normalize_payment_status(order.payment_status),
+        "paid_at": order.paid_at,
         "completed_at": order.completed_at,
     }
 
@@ -15105,6 +15403,7 @@ def get_student_cart(student_id: str, db: Session = Depends(get_db)):
             },
             "subtotal": 0.0,
             "platform_fee": 0.0,
+            "seller_commission": 0.0,
             "checkout_total": 0.0,
         }
 
@@ -15118,7 +15417,7 @@ def get_student_cart(student_id: str, db: Session = Depends(get_db)):
     items = []
     total_quantity = 0
     cart_subtotal = Decimal("0.00")
-    platform_fee = Decimal("0.00")
+    seller_commission = Decimal("0.00")
     stale_items = []
     for item in cart_items:
         product = db.query(Product).filter(Product.id == item.product_id).first()
@@ -15131,7 +15430,7 @@ def get_student_cart(student_id: str, db: Session = Depends(get_db)):
         line_subtotal = (Decimal(str(_parse_price_to_etb(product.price))) * quantity).quantize(Decimal("0.01"))
         line_fee = _calculate_platform_commission(db, line_subtotal)
         cart_subtotal += line_subtotal
-        platform_fee += line_fee
+        seller_commission += line_fee
         items.append({
             "id": item.id,
             "student_id": item.student_id,
@@ -15140,7 +15439,8 @@ def get_student_cart(student_id: str, db: Session = Depends(get_db)):
             "created_at": item.created_at,
             "title": product.title,
             "price": product.price,
-            "platform_fee": float(line_fee),
+            "platform_fee": 0.0,
+            "seller_commission": float(line_fee),
             "stock": int(getattr(product, "stock", 1) or 0),
             "description": product.description,
             "image": _normalize_product_image(product.image),
@@ -15167,9 +15467,11 @@ def get_student_cart(student_id: str, db: Session = Depends(get_db)):
     return {
         "items": items,
         "meta": meta,
+        "total": float(cart_subtotal),
         "subtotal": float(cart_subtotal),
-        "platform_fee": float(platform_fee),
-        "checkout_total": float(cart_subtotal + platform_fee),
+        "platform_fee": 0.0,
+        "seller_commission": float(seller_commission),
+        "checkout_total": float(cart_subtotal),
     }
 
 
@@ -15767,6 +16069,7 @@ def get_product_pay_summary(
     if not seller:
         raise HTTPException(status_code=409, detail="The listing seller could not be verified.")
     unit_price = _validated_payment_unit_price(product.price)
+    item_total = (unit_price * quantity).quantize(Decimal("0.01"))
     wallet = db.query(Wallet).filter(Wallet.student_id == buyer.student_id).first()
     balance = Decimal(str(wallet.balance if wallet else buyer.wallet_balance or 0)).quantize(Decimal("0.01"))
     return {
@@ -15777,7 +16080,9 @@ def get_product_pay_summary(
         "quantity_limit": stock,
         "stock": stock,
         "quantity": quantity,
-        "total": str((unit_price * quantity).quantize(Decimal("0.01"))),
+        "total": str(item_total),
+        "checkout_total": str(item_total),
+        "seller_commission": str(_calculate_platform_commission(db, item_total)),
         "seller_name": seller.name,
         "wallet_balance": str(balance),
         "has_wallet_pin": buyer.has_wallet_pin,
@@ -16101,6 +16406,415 @@ def pay_for_product(
         raise HTTPException(status_code=500, detail="Unable to complete wallet payment.")
 
 
+@app.post("/api/products/{product_id}/checkout")
+async def initialize_product_chapa_checkout(
+    product_id: int,
+    payload: ProductCheckoutRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    buyer = _student_from_authorization(authorization, db)
+    _require_verified_student(buyer, db, "checking out")
+    payment_settings = get_payment_settings(db)
+    if not payment_settings["enableOnlinePayment"]:
+        raise HTTPException(status_code=503, detail="Online payment is currently disabled.")
+
+    key = idempotency_key.strip()
+    if not 8 <= len(key) <= 64:
+        raise HTTPException(status_code=422, detail="Idempotency-Key must contain 8 to 64 characters.")
+
+    try:
+        secret = get_chapa_secret_key()
+    except PayoutProviderError as error:
+        raise HTTPException(status_code=503, detail="Chapa checkout is not configured.") from error
+    if not secret:
+        raise HTTPException(status_code=503, detail="Chapa checkout is not configured.")
+
+    try:
+        callback_url = _get_public_payment_url("CHAPA_CALLBACK_URL")
+        return_url = _get_chapa_return_url()
+        if not _is_production_environment():
+            return_url = f"{return_url.rstrip('/')}/dashboard"
+    except HTTPException as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Payment setup is incomplete. Configure the public payment callback and frontend URLs.",
+        ) from error
+
+    scoped_key = f"{buyer.student_id}:chapa-product:{key}"
+    order = None
+    transaction = None
+    seller_account = None
+
+    try:
+        existing_payment = (
+            db.query(PaymentIdempotency)
+            .filter(PaymentIdempotency.idempotency_key == scoped_key)
+            .with_for_update()
+            .first()
+        )
+        if existing_payment:
+            order = db.query(Order).filter(Order.id == existing_payment.order_id).with_for_update().first()
+            transaction = (
+                db.query(Transaction)
+                .filter(Transaction.tx_id == existing_payment.transaction_id)
+                .with_for_update()
+                .first()
+            )
+            if (
+                not order
+                or not transaction
+                or order.student_id != buyer.student_id
+                or order.product_id != product_id
+            ):
+                raise HTTPException(status_code=409, detail="This Idempotency-Key was already used for another checkout.")
+            if _normalize_payment_status(transaction.status) == "Successful":
+                return {
+                    "status": "success",
+                    "message": "This product payment is already complete.",
+                    "order_id": order.id,
+                    "tx_ref": transaction.tx_id,
+                    "already_paid": True,
+                }
+            transaction_status = _normalize_payment_status(transaction.status)
+            order_payment_status = _normalize_payment_status(order.payment_status)
+            if transaction_status != "Pending" or order_payment_status != "Pending":
+                terminal_statuses = {"Failed", "Expired", "Cancelled"}
+                if transaction_status in terminal_statuses and order_payment_status in terminal_statuses:
+                    # The prior attempt cannot settle; release its key so a retry can reserve stock again.
+                    db.delete(existing_payment)
+                    db.flush()
+                    existing_payment = None
+                else:
+                    raise HTTPException(status_code=409, detail="This checkout is no longer available. Start a new checkout.")
+            if existing_payment:
+                product = db.query(Product).filter(Product.id == product_id).first()
+                seller = _payment_product_seller(db, product) if product else None
+                if not seller or seller.student_id != order.seller_id:
+                    raise HTTPException(status_code=409, detail="The listing seller could not be verified.")
+                seller_account = (
+                    db.query(SellerPaymentAccount)
+                    .filter(SellerPaymentAccount.student_id == seller.student_id)
+                    .with_for_update()
+                    .first()
+                )
+                if (
+                    not seller_account
+                    or str(seller_account.account_status or "").strip().casefold() != "active"
+                    or not str(seller_account.chapa_sub_account_id or "").strip()
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The seller must complete Chapa payout setup before this product can be purchased.",
+                    )
+        if not existing_payment:
+            product = (
+                db.query(Product)
+                .filter(Product.id == product_id)
+                .with_for_update()
+                .first()
+            )
+            if not product:
+                raise HTTPException(status_code=404, detail="This listing is not available for purchase.")
+            if _is_product_owner(db, product, buyer):
+                raise HTTPException(status_code=403, detail="You cannot buy your own listing.")
+
+            seller = _payment_product_seller(db, product)
+            if not seller or seller.student_id == buyer.student_id:
+                raise HTTPException(status_code=409, detail="The listing seller could not be verified.")
+
+            seller_account = (
+                db.query(SellerPaymentAccount)
+                .filter(SellerPaymentAccount.student_id == seller.student_id)
+                .with_for_update()
+                .first()
+            )
+            if (
+                not seller_account
+                or str(seller_account.account_status or "").strip().casefold() != "active"
+                or not str(seller_account.chapa_sub_account_id or "").strip()
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The seller must complete Chapa payout setup before this product can be purchased.",
+                )
+            if seller_account.provider_id:
+                payout_provider = (
+                    db.query(PayoutProvider)
+                    .filter(PayoutProvider.id == seller_account.provider_id)
+                    .first()
+                )
+                if not payout_provider or not payout_provider.is_active:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The seller's payout account is inactive. Ask the seller to update their payout setup.",
+                    )
+
+            cart_item = (
+                db.query(CartItem)
+                .filter(
+                    CartItem.student_id == buyer.student_id,
+                    CartItem.product_id == product_id,
+                )
+                .with_for_update()
+                .first()
+            )
+            if not cart_item:
+                raise HTTPException(status_code=409, detail="Add this product to your cart before paying.")
+            quantity = payload.quantity
+            stock = int(product.stock or 0)
+            if str(product.status or "").strip().lower() not in {"approved", "active", "visible", "published"}:
+                raise HTTPException(status_code=404, detail="This listing is not available for purchase.")
+            if quantity > stock or quantity > int(cart_item.quantity or 1):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "OUT_OF_STOCK", "message": "Requested quantity exceeds available cart or listing stock.", "stock": stock},
+                )
+
+            amount = (
+                _validated_payment_unit_price(product.price) * Decimal(quantity)
+            ).quantize(Decimal("0.01"))
+            commission_settings = _get_commission_settings(db)
+            commission = commission_fee_from_settings(amount, commission_settings).quantize(Decimal("0.01"))
+            commission_rate = (
+                as_decimal(commission_settings["commission_rate"], field_name="commission_rate")
+                if commission_settings["commission_enabled"]
+                else Decimal("0")
+            )
+            if amount <= 0 or commission > amount:
+                raise HTTPException(status_code=409, detail="This listing has an invalid payment amount.")
+
+            tx_ref = f"TX-{uuid.uuid4().hex.upper()}"
+            order = Order(
+                student_id=buyer.student_id,
+                product_id=product.id,
+                title=product.title,
+                price=str(_validated_payment_unit_price(product.price)),
+                platform_fee=Decimal("0.00"),
+                seller_commission=commission,
+                commission_rate=commission_rate,
+                commission_type=commission_settings["commission_type"],
+                product_category=product.category,
+                product_subcategory=product.subcategory,
+                product_description=product.description,
+                product_condition=product.condition,
+                product_image=product.image,
+                seller_id=seller.student_id,
+                seller_name=seller.name,
+                seller_business_name=seller_account.business_name,
+                buyer_name=buyer.name,
+                buyer_email=buyer.email,
+                buyer_phone=buyer.phone,
+                quantity=quantity,
+                status="Pending",
+                payment_status="Pending",
+                is_funds_released=False,
+            )
+            product.stock = stock - quantity
+            _sync_product_status_with_stock(product)
+            db.add(order)
+            db.flush()
+            transaction = Transaction(
+                student_id=buyer.student_id,
+                wallet_id=None,
+                tx_id=tx_ref,
+                type="Product Purchase",
+                amount=amount,
+                description=f"Pending Chapa split payment for order #{order.id}",
+                status="Pending",
+            )
+            db.add(transaction)
+            db.add(PaymentIdempotency(
+                idempotency_key=scoped_key,
+                order_id=order.id,
+                buyer_id=buyer.student_id,
+                product_id=product.id,
+                transaction_id=tx_ref,
+            ))
+            db.commit()
+            db.refresh(order)
+            db.refresh(transaction)
+            seller_account = (
+                db.query(SellerPaymentAccount)
+                .filter(SellerPaymentAccount.student_id == seller.student_id)
+                .first()
+            )
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="This product checkout is already being processed.") from error
+    except SQLAlchemyError as error:
+        db.rollback()
+        logging.getLogger("app.payments").exception(
+            "Unable to save pending Chapa product checkout for product %s.",
+            product_id,
+        )
+        raise HTTPException(status_code=500, detail="Unable to save the pending product order safely.") from error
+
+    if not order or not transaction or not seller_account:
+        raise HTTPException(status_code=500, detail="Unable to prepare product checkout safely.")
+
+    amount = Decimal(str(transaction.amount)).quantize(Decimal("0.01"))
+    commission = Decimal(str(order.seller_commission or 0)).quantize(Decimal("0.01"))
+    commission_rate = Decimal(str(order.commission_rate or 0))
+    raw_percentage_commission = (amount * commission_rate / Decimal("100")).quantize(Decimal("0.01"))
+    if (
+        str(order.commission_type or "").strip().lower() == "percentage"
+        and commission == raw_percentage_commission
+        and commission_rate > 0
+    ):
+        split_type = "percentage"
+        split_value = commission_rate.quantize(Decimal("0.0001"))
+    elif commission > 0:
+        split_type = "flat"
+        split_value = commission
+    else:
+        split_type = None
+        split_value = None
+
+    name_parts = (buyer.name or "Student").strip().split(maxsplit=1)
+    marketplace_name = str(
+        _get_setting_value(
+            db,
+            "general",
+            "marketplaceName",
+            DEFAULT_SETTINGS_BLOCKS["general"]["marketplaceName"],
+        )
+        or DEFAULT_SETTINGS_BLOCKS["general"]["marketplaceName"]
+    ).strip()[:16]
+    chapa_payload = {
+        "amount": f"{amount:.2f}",
+        "currency": "ETB",
+        "email": buyer.email,
+        "first_name": name_parts[0],
+        "last_name": name_parts[1] if len(name_parts) > 1 else name_parts[0],
+        "tx_ref": transaction.tx_id,
+        "callback_url": callback_url,
+        "return_url": return_url,
+        "customization": {"title": marketplace_name},
+        "subaccounts": {
+            "id": seller_account.chapa_sub_account_id,
+            **(
+                {"split_type": split_type, "split_value": str(split_value)}
+                if split_value is not None and split_value > 0
+                else {}
+            ),
+        },
+    }
+
+    def fail_product_checkout(*, release_inventory: bool) -> None:
+        if release_inventory:
+            _release_pending_chapa_product_order(db, transaction.tx_id, expired=False)
+
+    payment_logger = logging.getLogger("app.payments")
+    payment_logger.info(
+        "Chapa product checkout request tx_ref=%s payload=%s",
+        transaction.tx_id,
+        json.dumps(chapa_payload, ensure_ascii=False, separators=(",", ":")),
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                "https://api.chapa.co/v1/transaction/initialize",
+                headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+                json=chapa_payload,
+            )
+            try:
+                response_payload = response.json()
+            except ValueError as error:
+                if response.is_error:
+                    response_payload = None
+                else:
+                    payment_logger.error(
+                        "Chapa product checkout failed tx_ref=%s http_status=%s response_body=%s",
+                        transaction.tx_id,
+                        response.status_code,
+                        response.text,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Chapa returned an invalid checkout response.",
+                    ) from error
+    except httpx.TimeoutException as error:
+        logging.getLogger("app.payments").warning(
+            "Chapa product checkout timed out tx_ref=%s; pending checkout retained for retry.",
+            transaction.tx_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Chapa did not respond in time. Retry checkout to resume the same payment safely.",
+        ) from error
+    except httpx.HTTPError as error:
+        logging.getLogger("app.payments").warning(
+            "Chapa product checkout request failed tx_ref=%s error_type=%s.",
+            transaction.tx_id,
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Chapa is temporarily unavailable. Retry checkout to resume the same payment safely.",
+        ) from error
+    response_data = response_payload.get("data") if isinstance(response_payload, dict) else None
+    checkout_url = response_data.get("checkout_url") if isinstance(response_data, dict) else None
+    if response.is_error or not checkout_url:
+        response_body = response.text
+        payment_logger.error(
+            "Chapa product checkout failed tx_ref=%s http_status=%s response_body=%s",
+            transaction.tx_id,
+            response.status_code,
+            response_body,
+        )
+        release_inventory = response.status_code < 500
+        fail_product_checkout(release_inventory=release_inventory)
+        if response.status_code == 400:
+            provider_message = None
+            if isinstance(response_payload, dict):
+                provider_message = response_payload.get("message") or response_payload.get("error")
+                provider_data = response_payload.get("data")
+                if isinstance(provider_data, dict):
+                    provider_message = provider_message or provider_data.get("message")
+                provider_errors = response_payload.get("errors")
+                if provider_errors is None and isinstance(provider_data, dict):
+                    provider_errors = provider_data.get("errors")
+                if provider_errors:
+                    error_detail = json.dumps(
+                        provider_errors,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    provider_message = (
+                        f"{provider_message}: {error_detail}"
+                        if provider_message
+                        else error_detail
+                    )
+                elif isinstance(provider_message, (dict, list)):
+                    provider_message = json.dumps(
+                        provider_message,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+            raise HTTPException(
+                status_code=400,
+                detail=str(provider_message or response_body or "Chapa rejected the checkout request."),
+            )
+        if response.status_code in {401, 403}:
+            raise HTTPException(status_code=502, detail="Chapa rejected the payment credentials. Please contact support.")
+        if response.status_code == 429 or response.status_code >= 500:
+            raise HTTPException(status_code=503, detail="Chapa is temporarily unavailable. Retry checkout shortly.")
+        raise HTTPException(status_code=502, detail="Chapa could not initialize this product payment.")
+
+    return {
+        "status": "success",
+        "message": "Product payment initialized successfully.",
+        "checkout_url": checkout_url,
+        "tx_ref": transaction.tx_id,
+        "order_id": order.id,
+    }
+
+
 def _build_seller_listing_analytics(listings: list, completed_orders: list) -> list:
     completed_orders_by_product = Counter(order.product_id for order in completed_orders)
     completed_revenue_by_product = Counter()
@@ -16343,11 +17057,20 @@ def get_student_order_receipt(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
-    buyer = _student_from_authorization(authorization, db)
+    viewer = _student_from_authorization(authorization, db)
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found.")
-    if buyer.student_id.strip().lower() != order.student_id.strip().lower():
+    product = db.query(Product).filter(Product.id == order.product_id).first()
+    seller_identifier = getattr(order, "seller_id", None) or (product.seller if product else None)
+    seller = db.query(Student).filter(
+        or_(Student.student_id == seller_identifier, Student.name == seller_identifier)
+    ).first() if seller_identifier else None
+    is_buyer = viewer.student_id.strip().lower() == order.student_id.strip().lower()
+    is_seller = bool(
+        seller and seller.student_id.strip().lower() == viewer.student_id.strip().lower()
+    )
+    if not is_buyer and not is_seller:
         raise HTTPException(status_code=403, detail="You are not authorized to view this receipt.")
     normalized_order_status = _normalize_order_status(order.status).lower()
     if normalized_order_status in {"rejected", "expired", "refunded"}:
@@ -16361,33 +17084,50 @@ def get_student_order_receipt(
     if _normalize_payment_status(order.payment_status) != "Successful":
         raise HTTPException(status_code=409, detail="A receipt is available only for paid orders.")
 
-    product = db.query(Product).filter(Product.id == order.product_id).first()
-    seller_identifier = getattr(order, "seller_id", None) or (product.seller if product else None)
-    seller = db.query(Student).filter(
-        or_(Student.student_id == seller_identifier, Student.name == seller_identifier)
-    ).first() if seller_identifier else None
     quantity = int(getattr(order, "quantity", 1) or 1)
     unit_price = Decimal(str(_parse_price_to_etb(order.price))).quantize(Decimal("0.01"))
     item_total = (unit_price * quantity).quantize(Decimal("0.01"))
     platform_commission, commission_percent, commission_type = _order_commission_details(order, item_total)
 
-    # The order-specific description identifies the successful buyer debit,
-    # even when legacy order amounts or timestamps no longer match its fields.
+    chapa_transaction_ids = (
+        db.query(PaymentIdempotency.transaction_id)
+        .filter(
+            PaymentIdempotency.order_id == order.id,
+            PaymentIdempotency.buyer_id == order.student_id,
+        )
+    )
     payment_transaction = (
         db.query(Transaction)
         .filter(
             Transaction.student_id == order.student_id,
             or_(
                 Transaction.tx_id == f"ORDER-PAY-{order.id}",
+                Transaction.tx_id.in_(chapa_transaction_ids),
+                func.lower(func.coalesce(Transaction.description, ""))
+                == f"chapa split payment for order #{order.id}",
                 and_(
-                    Transaction.type == "Escrow Hold",
-                    Transaction.status.in_(["Held", "Successful", "Released", "Refunded"]),
-                    Transaction.description == f"Escrow hold for order #{order.id}",
+                    func.lower(Transaction.type) == "escrow hold",
+                    func.lower(func.coalesce(Transaction.description, ""))
+                    == f"escrow hold for order #{order.id}",
                 ),
             ),
-            Transaction.status.in_(["Successful", "Released", "Refunded"]),
+            func.lower(func.trim(Transaction.status)).in_(
+                ["successful", "success", "paid", "completed", "held", "released", "refunded"]
+            ),
         )
-        .order_by(Transaction.created_at.asc())
+        .order_by(
+            case(
+                (Transaction.tx_id == f"ORDER-PAY-{order.id}", 0),
+                (Transaction.tx_id.in_(chapa_transaction_ids), 1),
+                (
+                    func.lower(func.coalesce(Transaction.description, ""))
+                    == f"chapa split payment for order #{order.id}",
+                    1,
+                ),
+                else_=2,
+            ),
+            Transaction.created_at.desc(),
+        )
         .first()
     )
     if not payment_transaction:
@@ -16404,10 +17144,17 @@ def get_student_order_receipt(
         Transaction.description.like(f"%order #{order.id}%"),
     ).order_by(Transaction.created_at.desc()).first()
     dispute = db.query(Dispute).filter(Dispute.order_id == order.id).order_by(Dispute.created_at.desc()).first()
-    buyer_name = getattr(order, "buyer_name", None) or buyer.name or buyer.student_id
+    buyer = db.query(Student).filter(Student.student_id == order.student_id).first()
+    buyer_name = getattr(order, "buyer_name", None) or (buyer.name if buyer else None) or order.student_id
     seller_name = getattr(order, "seller_name", None) or (seller.name if seller else None) or seller_identifier or "Campus Seller"
     is_direct_payment = payment_transaction.tx_id == f"ORDER-PAY-{order.id}"
+    is_chapa_payment = (
+        _normalize_payment_type(payment_transaction.type) == "Product Purchase"
+        and payment_transaction.wallet_id is None
+    )
     payment_message = (
+        "The buyer paid through Chapa Split Payment."
+        if is_chapa_payment else
         "Payment was transferred to the seller at handover."
         if is_direct_payment else
         "This is a legacy order with escrow payment history."
@@ -16430,10 +17177,10 @@ def get_student_order_receipt(
         "platform_commission_percent": float(commission_percent),
         "platform_commission_label": _order_commission_label(commission_percent, commission_type),
         "total_paid": float(payment_transaction.amount),
-        "payment_method": _normalize_payment_type(payment_transaction.type),
+        "payment_method": "Chapa Split Payment" if is_chapa_payment else _normalize_payment_type(payment_transaction.type),
         "transaction_reference": payment_transaction.tx_id,
         "buyer_name": buyer_name,
-        "buyer_email": buyer.email or "",
+        "buyer_email": (buyer.email or "") if is_buyer else "",
         "seller_name": seller_name,
         "order_status": _normalize_order_status(order.status),
         "payment_message": payment_message,
@@ -17029,11 +17776,27 @@ FRONTEND_BASE_URL = (
 
 
 @app.get("/api/payment/return")
-async def chapa_payment_return(request: Request):
+async def chapa_payment_return(request: Request, db: Session = Depends(get_db)):
     """Send Chapa's browser return back to the configured frontend."""
-    target_url = FRONTEND_BASE_URL
+    reference = (
+        request.query_params.get("trx_ref")
+        or request.query_params.get("tx_ref")
+        or request.query_params.get("ref_id")
+    )
+    transaction = (
+        db.query(Transaction)
+        .filter(Transaction.tx_id == reference)
+        .first()
+        if reference
+        else None
+    )
+    target_url = (
+        f"{FRONTEND_BASE_URL}/dashboard"
+        if transaction and _normalize_payment_type(transaction.type) == "Product Purchase"
+        else f"{FRONTEND_BASE_URL}/"
+    )
     if request.url.query:
-        target_url = f"{target_url}/?{request.url.query}"
+        target_url = f"{target_url}?{request.url.query}"
     return RedirectResponse(url=target_url, status_code=303)
 
 
@@ -22031,6 +22794,7 @@ def get_admin_payments_endpoint(
             payment_status = _normalize_payment_status(tx.status or "Pending")
             payment_source = f"{tx.type or ''} {tx.description or ''}".lower()
             is_chapa_deposit = payment_type_value == "Wallet Deposit" and "chapa" in payment_source
+            is_chapa_product_payment = payment_type_value == "Product Purchase" and tx.wallet_id is None
             is_wallet_withdrawal = (
                 payment_type_value in {"Seller Payout", "Wallet Withdrawal"}
                 or str(tx.tx_id or "").upper().startswith("PAYOUT-")
@@ -22038,7 +22802,7 @@ def get_admin_payments_endpoint(
             parsed_order_id = None if is_chapa_deposit or is_wallet_withdrawal else get_order_id(tx)
             related_order = orders_by_id.get(parsed_order_id)
             payment_method = (
-                "Chapa" if payment_type_value == "Wallet Deposit"
+                "Chapa" if payment_type_value == "Wallet Deposit" or is_chapa_product_payment
                 else "Wallet" if payment_type_value == "Product Purchase"
                 else "SantimPay" if payment_type_value == "Seller Payout"
                 else "Wallet"
@@ -22157,10 +22921,23 @@ def verify_payment_with_chapa(
     transaction = db.query(Transaction).filter(Transaction.tx_id == tx_ref).first()
     if not transaction:
         raise HTTPException(status_code=404, detail="Payment transaction not found.")
-    if _normalize_payment_type(transaction.type) != "Wallet Deposit":
-        raise HTTPException(status_code=400, detail="Only wallet deposits can be verified through Chapa.")
     if transaction.student_id != student.student_id:
-        raise HTTPException(status_code=403, detail="You can only verify your own wallet deposits.")
+        raise HTTPException(status_code=403, detail="You can only verify your own payments.")
+    transaction_type = _normalize_payment_type(transaction.type)
+    if transaction_type not in {"Wallet Deposit", "Product Purchase"}:
+        raise HTTPException(status_code=400, detail="This payment type cannot be verified through Chapa.")
+    payment_record = None
+    order = None
+    if transaction_type == "Product Purchase":
+        payment_record = db.query(PaymentIdempotency).filter(
+            PaymentIdempotency.transaction_id == tx_ref,
+            PaymentIdempotency.buyer_id == student.student_id,
+        ).first()
+        if not payment_record or not payment_record.order_id:
+            raise HTTPException(status_code=404, detail="Product order not found for payment.")
+        order = db.query(Order).filter(Order.id == payment_record.order_id).first()
+        if not order or order.student_id != student.student_id:
+            raise HTTPException(status_code=404, detail="Product order not found for payment.")
 
     expected_amount = Decimal(str(transaction.amount)).quantize(Decimal("0.01"))
     if os.getenv("CHAPA_MODE", "").strip().lower() == "test":
@@ -22180,40 +22957,74 @@ def verify_payment_with_chapa(
     settlement = None
     try:
         if gateway_status == "Successful":
-            settlement = _settle_verified_chapa_transaction(db, tx_ref, expected_amount=verification["amount"])
-            db.commit()
+            if transaction_type == "Wallet Deposit":
+                settlement = _settle_verified_chapa_transaction(
+                    db,
+                    tx_ref,
+                    expected_amount=verification["amount"],
+                )
+            else:
+                settlement = _settle_verified_chapa_product_order(
+                    db,
+                    tx_ref,
+                    expected_amount=verification["amount"],
+                )
             transaction = db.query(Transaction).filter(Transaction.tx_id == tx_ref).first()
         else:
-            db.rollback()
-            with db.begin():
-                transaction = (
-                    db.query(Transaction)
-                    .filter(Transaction.tx_id == tx_ref)
-                    .with_for_update()
-                    .first()
+            if transaction_type == "Product Purchase" and gateway_status in {"Failed", "Cancelled", "Expired"}:
+                _release_pending_chapa_product_order(
+                    db,
+                    tx_ref,
+                    expired=gateway_status == "Expired",
                 )
-                if not transaction:
-                    raise HTTPException(status_code=404, detail="Payment transaction not found.")
-                if _normalize_payment_status(transaction.status) != "Successful":
-                    transaction.status = gateway_status
+            else:
+                db.rollback()
+                with db.begin():
+                    transaction = (
+                        db.query(Transaction)
+                        .filter(Transaction.tx_id == tx_ref)
+                        .with_for_update()
+                        .first()
+                    )
+                    if not transaction:
+                        raise HTTPException(status_code=404, detail="Payment transaction not found.")
+                    if _normalize_payment_status(transaction.status) != "Successful":
+                        transaction.status = gateway_status
+                        if transaction_type == "Product Purchase":
+                            order = (
+                                db.query(Order)
+                                .filter(Order.id == payment_record.order_id)
+                                .with_for_update()
+                                .first()
+                            )
+                            if order and _normalize_payment_status(order.payment_status) != "Successful":
+                                order.payment_status = gateway_status
 
         if not transaction:
             raise HTTPException(status_code=404, detail="Payment transaction not found after verification.")
         db.refresh(transaction)
         final_status = _normalize_payment_status(transaction.status)
-        wallet_balance = settlement["wallet_balance"] if settlement else (
-            db.query(Student.wallet_balance)
-            .filter(Student.student_id == transaction.student_id)
-            .scalar()
-        )
-        return {
+        result = {
             "success": True,
             "transaction_id": transaction.tx_id,
             "status": final_status,
             "amount": float(expected_amount),
             "chapa_reference": verification["tx_ref"],
-            "wallet_balance": float(wallet_balance or 0),
+            "transaction_type": transaction_type,
         }
+        if transaction_type == "Wallet Deposit":
+            wallet_balance = settlement["wallet_balance"] if settlement else (
+                db.query(Student.wallet_balance)
+                .filter(Student.student_id == transaction.student_id)
+                .scalar()
+            )
+            result["wallet_balance"] = float(wallet_balance or 0)
+        else:
+            order = db.query(Order).filter(Order.id == payment_record.order_id).first()
+            result["order_id"] = order.id if order else None
+            result["order_status"] = order.status if order else None
+            result["order"] = _serialize_order(db, order) if order else None
+        return result
     except HTTPException:
         db.rollback()
         raise
@@ -22476,12 +23287,17 @@ async def acknowledge_chapa_get_callback(
     tx_ref: Optional[str] = None,
     status: Optional[str] = None,
     ref_id: Optional[str] = None,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
     """Verify Chapa browser callbacks so successful deposits settle automatically."""
     reference = (trx_ref or tx_ref or ref_id or "").strip() or None
     if reference:
-        return verify_payment_with_chapa(reference, db)
+        return verify_payment_with_chapa(
+            reference,
+            authorization=authorization,
+            db=db,
+        )
 
     return {
         "success": True,
@@ -22600,15 +23416,23 @@ async def simulate_chapa_webhook(
     transaction = db.query(Transaction).filter(Transaction.tx_id == tx_ref).first()
     if not transaction:
         raise HTTPException(status_code=404, detail="Pending payment transaction not found for callback.")
-    if _normalize_payment_type(transaction.type) != "Wallet Deposit":
+    transaction_type = _normalize_payment_type(transaction.type)
+    if transaction_type == "Product Purchase":
+        product_payment = db.query(PaymentIdempotency).filter(
+            PaymentIdempotency.transaction_id == tx_ref,
+            PaymentIdempotency.order_id.isnot(None),
+        ).first()
+        if not product_payment:
+            transaction_type = "Other"
+    if transaction_type not in {"Wallet Deposit", "Product Purchase"}:
         webhook_logger.warning(
-            "Ignored signed Chapa callback for non-wallet-deposit transaction tx_ref=%s type=%s status=%s.",
+            "Ignored signed Chapa callback for unrelated transaction tx_ref=%s type=%s status=%s.",
             tx_ref,
             transaction.type,
             status_value,
         )
         return {
-            "message": "Payment callback received; no settlement was performed because this transaction is not a wallet deposit.",
+            "message": "Payment callback received; no settlement was performed because this transaction is not a wallet deposit or linked product order.",
             "status": status_value,
             "verified": True,
             "settled": False,
@@ -22657,6 +23481,34 @@ async def simulate_chapa_webhook(
             raise HTTPException(status_code=400, detail="Chapa verification amount does not match the callback.")
         if verification["currency"] != "ETB":
             raise HTTPException(status_code=400, detail="Chapa verification currency must be ETB.")
+        if transaction_type == "Product Purchase":
+            settlement = _settle_verified_chapa_product_order(
+                db,
+                tx_ref,
+                expected_amount=verification["amount"],
+            )
+            if settlement["already_settled"]:
+                return {
+                    "message": "Product payment webhook was already processed; replay blocked.",
+                    "status": "Successful",
+                    "transaction_id": settlement["transaction_id"],
+                    "student_id": settlement["student_id"],
+                    "order_id": settlement["order_id"],
+                    "amount": float(settlement["amount"]),
+                    "settled": False,
+                }
+            return {
+                "message": "Product payment webhook processed successfully.",
+                "status": "Successful",
+                "verified": True,
+                "settled": True,
+                "transaction_id": settlement["transaction_id"],
+                "student_id": settlement["student_id"],
+                "order_id": settlement["order_id"],
+                "amount": float(settlement["amount"]),
+                "commission": float(settlement["commission"]),
+            }
+
         settlement = _settle_verified_chapa_transaction(db, tx_ref, expected_amount=verification["amount"])
         if settlement["already_settled"]:
             return {
@@ -24715,6 +25567,7 @@ def delete_subcategory(id: int, db: Session = Depends(get_db)):
 app.middleware_stack = CORSMiddleware(
     app.build_middleware_stack(),
     allow_origins=origins,
+    allow_origin_regex=r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

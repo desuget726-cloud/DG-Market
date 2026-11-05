@@ -34,24 +34,24 @@ const renderCard = (props = {}) => render(
 afterEach(cleanup);
 
 describe('BuyerHubProductCard purchase actions', () => {
-  it('shows Add to Cart and wishlist, but no wallet payment, when not in cart', () => {
+  it('shows Add to Cart and wishlist, but no direct payment, when not in cart', () => {
     renderCard({ isInCart: false });
 
     expect(screen.getByRole('button', { name: 'Add to Cart', exact: true })).toBeTruthy();
     expect(screen.getByRole('button', { name: '♡ Add to Wishlist', exact: true })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Pay with wallet', exact: true })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Pay with Chapa', exact: true })).toBeNull();
   });
 
-  it('shows wallet payment and In cart, but no Add to Cart, when already in cart', () => {
+  it('shows Chapa payment and In cart, but no Add to Cart, when already in cart', () => {
     const onPay = vi.fn();
     renderCard({ isInCart: true, onPay });
 
     expect(screen.getByText('In cart')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Pay with wallet', exact: true })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Pay with Chapa', exact: true })).toBeTruthy();
     expect(screen.getByRole('button', { name: '♡ Add to Wishlist', exact: true })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Add to Cart', exact: true })).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Pay with wallet', exact: true }));
+    fireEvent.click(screen.getByRole('button', { name: 'Pay with Chapa', exact: true }));
     expect(onPay).toHaveBeenCalledOnce();
   });
 
@@ -60,7 +60,7 @@ describe('BuyerHubProductCard purchase actions', () => {
 
     expect(screen.getByText('This is your listing')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Add to Cart', exact: true })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Pay with wallet', exact: true })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Pay with Chapa', exact: true })).toBeNull();
     expect(screen.queryByRole('button', { name: '♡ Add to Wishlist', exact: true })).toBeNull();
   });
 
@@ -69,7 +69,7 @@ describe('BuyerHubProductCard purchase actions', () => {
 
     expect(screen.getByText('Sold out')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Add to Cart', exact: true })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Pay with wallet', exact: true })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Pay with Chapa', exact: true })).toBeNull();
     expect(screen.getByRole('button', { name: '♡ Add to Wishlist', exact: true })).toBeTruthy();
   });
 });

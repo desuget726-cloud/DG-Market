@@ -1,4 +1,5 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import SellerOrderDetails from './SellerOrderDetails';
 
@@ -15,7 +16,10 @@ vi.mock('../../context/LanguageContext', () => ({
   }),
 }));
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 const renderOrderDetails = (timeline) => render(
   <SellerOrderDetails
@@ -46,6 +50,29 @@ const getTimelineItems = () => {
 };
 
 describe('SellerOrderDetails timeline', () => {
+  it('shows a settled payment and lets the seller view the official receipt', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        receipt_number: 'RCPT-20261028-0030',
+        order_number: 30,
+        payment_date: '2026-10-28T11:00:00+00:00',
+        product_name: 'Campus Textbook',
+        quantity: 1,
+        total_paid: 100,
+        transaction_reference: 'CHAPA-ORDER-30',
+        payment_message: 'The buyer paid through Chapa Split Payment.',
+      }),
+    }));
+    renderOrderDetails({});
+
+    expect(screen.getByRole('status')).toHaveTextContent('Payment Received / Order Settled');
+    await userEvent.setup().click(screen.getByRole('button', { name: 'View official receipt' }));
+
+    expect(await screen.findByText(/Official payment receipt · RCPT-20261028-0030/u)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Download receipt' })).toBeTruthy();
+  });
+
   it('renders three steps with consistent timestamps for a new order', () => {
     const timestamp = '2026-10-28T11:00:00+00:00';
     renderOrderDetails({

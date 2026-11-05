@@ -1,5 +1,5 @@
 const configuredApiBaseUrl = String(import.meta.env.VITE_API_URL || '').trim();
-export const API_BASE_URL = (configuredApiBaseUrl || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '')).replace(/\/+$/, '');
+export const API_BASE_URL = (configuredApiBaseUrl || (import.meta.env.DEV ? 'http://localhost:8000' : '')).replace(/\/+$/, '');
 if (import.meta.env.PROD && !configuredApiBaseUrl) {
     console.error('VITE_API_URL is not configured. Set it to the deployed backend origin.');
 }

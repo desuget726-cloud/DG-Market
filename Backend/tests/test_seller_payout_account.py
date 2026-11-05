@@ -299,6 +299,33 @@ class SellerPayoutAccountTests(unittest.TestCase):
             0,
         )
 
+    def test_chapa_subaccount_uses_documented_percentage_and_response_id(self):
+        client = self.make_chapa_client(
+            201,
+            {"status": "success", "data": {"subaccount_id": "chapa-test-subaccount"}},
+        )
+
+        with patch.object(main_module.httpx, "AsyncClient", return_value=client), \
+                patch.object(main_module, "_get_commission_settings", return_value={
+                    "commission_enabled": True,
+                    "commission_type": "percentage",
+                    "commission_rate": "1.0",
+                }):
+            subaccount_id = asyncio.run(main_module._create_chapa_subaccount(
+                self.db,
+                {
+                    "business_name": "Test Shop",
+                    "bank_code": self.provider.code,
+                    "account_number": "1234567890123",
+                    "account_name": "Payout Seller",
+                },
+                "test-secret",
+            ))
+
+        self.assertEqual(subaccount_id, "chapa-test-subaccount")
+        self.assertEqual(client.request_json["split_type"], "percentage")
+        self.assertEqual(client.request_json["split_value"], "1.0000")
+
     def test_chapa_validation_error_returns_422_and_keeps_database_unchanged(self):
         account = self.create_account(chapa_sub_account_id="chapa-test-subaccount")
         client = self.make_chapa_client(

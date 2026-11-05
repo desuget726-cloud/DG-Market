@@ -22,7 +22,9 @@ from app.models import (
     Notification,
     Order,
     PaymentIdempotency,
+    PayoutProvider,
     Product,
+    SellerPaymentAccount,
     Student,
     SystemSetting,
     Transaction,
@@ -145,6 +147,428 @@ def _snapshot(session_factory):
         }
 
 
+def _create_chapa_seller_account(session_factory, *, subaccount_id="subaccount-123", active=True):
+    with session_factory() as db:
+        provider = PayoutProvider(
+            name="Chapa Test Bank",
+            type="bank",
+            code="CHAPA-TEST-BANK",
+            is_active=True,
+            integration_status="available",
+        )
+        db.add(provider)
+        db.flush()
+        db.add(SellerPaymentAccount(
+            student_id="seller-1",
+            provider_id=provider.id,
+            chapa_sub_account_id=subaccount_id,
+            business_name="Seller Shop",
+            payout_type="bank",
+            bank_code=provider.code,
+            account_name="Seller",
+            account_status="Active" if active else "Pending",
+        ))
+        db.commit()
+
+
+def _configure_chapa_checkout(monkeypatch):
+    monkeypatch.setattr(main_module, "get_chapa_secret_key", lambda: "test-secret")
+    monkeypatch.setattr(
+        main_module,
+        "_get_public_payment_url",
+        lambda setting: (
+            "https://market.example.test/api/payment/webhook"
+            if setting == "CHAPA_CALLBACK_URL"
+            else "https://market.example.test/api/payment/return"
+        ),
+    )
+    monkeypatch.setattr(main_module, "_get_chapa_return_url", lambda: "https://market.example.test/return")
+
+
+def test_product_chapa_checkout_requires_active_seller_subaccount(market, monkeypatch):
+    client, session_factory, product_id = market
+    _configure_chapa_checkout(monkeypatch)
+
+    response = client.post(
+        f"/api/products/{product_id}/checkout",
+        headers=_headers(key="chapa-key-001"),
+        json={"quantity": 1},
+    )
+
+    assert response.status_code == 409
+    assert "seller must complete chapa payout setup" in response.json()["detail"].lower()
+    snapshot = _snapshot(session_factory)
+    assert snapshot["orders"] == 0
+    assert snapshot["stock"] == 3
+
+
+def test_product_chapa_checkout_rejects_inactive_seller_subaccount(market, monkeypatch):
+    client, session_factory, product_id = market
+    _create_chapa_seller_account(session_factory, active=False)
+    _configure_chapa_checkout(monkeypatch)
+
+    response = client.post(
+        f"/api/products/{product_id}/checkout",
+        headers=_headers(key="chapa-key-003"),
+        json={"quantity": 1},
+    )
+
+    assert response.status_code == 409
+    assert "seller must complete chapa payout setup" in response.json()["detail"].lower()
+    snapshot = _snapshot(session_factory)
+    assert snapshot["orders"] == 0
+    assert snapshot["stock"] == 3
+
+
+def test_product_chapa_checkout_retries_terminal_failure_with_same_idempotency_key(market, monkeypatch, caplog):
+    client, session_factory, product_id = market
+    _create_chapa_seller_account(session_factory)
+    _configure_chapa_checkout(monkeypatch)
+
+    class ChapaResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self.is_error = status_code >= 400
+            self.payload = payload
+            self.text = json.dumps(payload)
+
+        def json(self):
+            return self.payload
+
+    responses = [
+        ChapaResponse(400, {
+            "status": "failed",
+            "message": "Validation Error",
+            "errors": {"split_value": ["must be greater than zero"]},
+        }),
+        ChapaResponse(200, {
+            "status": "success",
+            "data": {"checkout_url": "https://checkout.chapa.test/retry"},
+        }),
+    ]
+    initialized_tx_refs = []
+    initialized_payloads = []
+
+    class RetryingChapaClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, json, **_kwargs):
+            initialized_tx_refs.append(json["tx_ref"])
+            initialized_payloads.append(dict(json))
+            return responses.pop(0)
+
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", lambda **_kwargs: RetryingChapaClient())
+    headers = _headers(key="chapa-retry-key-01")
+    caplog.set_level("INFO", logger="app.payments")
+    first_response = client.post(
+        f"/api/products/{product_id}/checkout",
+        headers=headers,
+        json={"quantity": 1},
+    )
+    assert first_response.status_code == 400
+    assert first_response.json()["detail"] == (
+        'Validation Error: {"split_value":["must be greater than zero"]}'
+    )
+    assert json.dumps(
+        initialized_payloads[0],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) in caplog.text
+    expected_error_body = json.dumps({
+        'status': 'failed',
+        'message': 'Validation Error',
+        'errors': {'split_value': ['must be greater than zero']},
+    })
+    assert f"response_body={expected_error_body}" in caplog.text
+    assert _snapshot(session_factory)["stock"] == 3
+
+    retry_response = client.post(
+        f"/api/products/{product_id}/checkout",
+        headers=headers,
+        json={"quantity": 1},
+    )
+    assert retry_response.status_code == 200, retry_response.text
+    assert retry_response.json()["checkout_url"] == "https://checkout.chapa.test/retry"
+    assert retry_response.json()["tx_ref"] == initialized_tx_refs[1]
+    assert initialized_tx_refs[0] != initialized_tx_refs[1]
+    with session_factory() as db:
+        orders = db.query(Order).order_by(Order.id).all()
+        transactions = db.query(Transaction).order_by(Transaction.id).all()
+        assert len(orders) == 2
+        assert orders[0].payment_status == "Failed"
+        assert orders[1].payment_status == "Pending"
+        assert transactions[0].status == "Failed"
+        assert transactions[1].status == "Pending"
+        assert db.query(PaymentIdempotency).count() == 1
+        assert db.query(Product).one().stock == 2
+
+
+def test_product_chapa_checkout_timeout_returns_json_error(market, monkeypatch):
+    client, session_factory, product_id = market
+    _create_chapa_seller_account(session_factory)
+    _configure_chapa_checkout(monkeypatch)
+    client_timeouts = []
+
+    class TimedOutChapaClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            raise main_module.httpx.TimeoutException("Chapa request timed out")
+
+    def create_chapa_client(**kwargs):
+        client_timeouts.append(kwargs.get("timeout"))
+        return TimedOutChapaClient()
+
+    monkeypatch.setattr(
+        main_module.httpx,
+        "AsyncClient",
+        create_chapa_client,
+    )
+
+    response = client.post(
+        f"/api/products/{product_id}/checkout",
+        headers=_headers(key="chapa-timeout-key-01"),
+        json={"quantity": 1},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Chapa did not respond in time. Retry checkout to resume the same payment safely."
+    )
+    assert client_timeouts == [15.0]
+    snapshot = _snapshot(session_factory)
+    assert snapshot["orders"] == 1
+    assert snapshot["stock"] == 2
+
+
+def test_product_chapa_checkout_omits_nonpositive_split_override(market, monkeypatch):
+    client, session_factory, product_id = market
+    _create_chapa_seller_account(session_factory)
+    _configure_chapa_checkout(monkeypatch)
+    with session_factory() as db:
+        payment_setting = db.query(SystemSetting).filter_by(key="payment").one()
+        settings = json.loads(payment_setting.value)
+        settings["commission"]["commission_enabled"] = False
+        payment_setting.value = json.dumps(settings)
+        db.commit()
+
+    captured_payload = {}
+
+    class ChapaResponse:
+        status_code = 200
+        is_error = False
+
+        def json(self):
+            return {"status": "success", "data": {"checkout_url": "https://checkout.chapa.test/pay"}}
+
+    class CapturingChapaClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, json, **_kwargs):
+            captured_payload.update(json)
+            return ChapaResponse()
+
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", lambda **_kwargs: CapturingChapaClient())
+    response = client.post(
+        f"/api/products/{product_id}/checkout",
+        headers=_headers(key="chapa-no-commission-key"),
+        json={"quantity": 1},
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured_payload["subaccounts"] == {"id": "subaccount-123"}
+
+
+def test_product_return_verification_settles_and_returns_updated_order(market, monkeypatch):
+    client, session_factory, product_id = market
+    _create_chapa_seller_account(session_factory)
+    _configure_chapa_checkout(monkeypatch)
+
+    class ChapaResponse:
+        status_code = 200
+        is_error = False
+
+        def json(self):
+            return {"status": "success", "data": {"checkout_url": "https://checkout.chapa.test/pay"}}
+
+    class CapturingChapaClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, json, **_kwargs):
+            return ChapaResponse()
+
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", lambda **_kwargs: CapturingChapaClient())
+    checkout = client.post(
+        f"/api/products/{product_id}/checkout",
+        headers=_headers(key="chapa-return-verify-key"),
+        json={"quantity": 1},
+    )
+    assert checkout.status_code == 200, checkout.text
+    tx_ref = checkout.json()["tx_ref"]
+
+    monkeypatch.setenv("CHAPA_MODE", "live")
+    verified_references = []
+
+    def verify_with_chapa(reference):
+        verified_references.append(reference)
+        return {
+            "tx_ref": reference,
+            "amount": Decimal("100.00"),
+            "currency": "ETB",
+            "status": "Successful",
+        }
+
+    monkeypatch.setattr(
+        main_module,
+        "_request_chapa_verification",
+        verify_with_chapa,
+    )
+    response = client.get(
+        f"/api/payment/verify/{tx_ref}",
+        headers=_headers(),
+    )
+
+    assert response.status_code == 200, response.text
+    verification = response.json()
+    assert verification["status"] == "Successful"
+    assert verification["transaction_type"] == "Product Purchase"
+    assert verification["order"]["id"] == verification["order_id"]
+    assert verification["order"]["status"] == "Completed"
+    assert verification["order"]["payment_status"] == "Successful"
+    assert verified_references == [tx_ref]
+    with session_factory() as db:
+        transaction = db.query(Transaction).filter_by(tx_id=tx_ref).one()
+        order = db.query(Order).filter_by(id=verification["order_id"]).one()
+        assert transaction.status == "Successful"
+        assert order.status == "Completed"
+        assert order.payment_status == "Successful"
+
+
+def test_product_chapa_split_checkout_and_webhook_do_not_credit_seller_wallet(market, monkeypatch):
+    client, session_factory, product_id = market
+    _create_chapa_seller_account(session_factory)
+    _configure_chapa_checkout(monkeypatch)
+    with session_factory() as db:
+        payment_setting = db.query(SystemSetting).filter_by(key="payment").one()
+        settings = json.loads(payment_setting.value)
+        settings["commission"]["commission_rate"] = "1.0"
+        payment_setting.value = json.dumps(settings)
+        db.commit()
+
+    captured_payload = {}
+
+    class ChapaResponse:
+        status_code = 200
+        is_error = False
+
+        def json(self):
+            return {"status": "success", "data": {"checkout_url": "https://checkout.chapa.test/pay"}}
+
+    class CapturingChapaClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, json, **_kwargs):
+            captured_payload.update(json)
+            return ChapaResponse()
+
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", lambda **_kwargs: CapturingChapaClient())
+    response = client.post(
+        f"/api/products/{product_id}/checkout",
+        headers=_headers(key="chapa-key-002"),
+        json={"quantity": 2},
+    )
+    assert response.status_code == 200, response.text
+    checkout = response.json()
+    assert checkout["checkout_url"] == "https://checkout.chapa.test/pay"
+    assert captured_payload["amount"] == "200.00"
+    assert captured_payload["subaccounts"] == {
+        "id": "subaccount-123",
+        "split_type": "percentage",
+        "split_value": "1.0000",
+    }
+    assert _snapshot(session_factory)["stock"] == 1
+
+    tx_ref = checkout["tx_ref"]
+    body = json.dumps({
+        "status": "success",
+        "tx_ref": tx_ref,
+        "amount": "200.00",
+        "currency": "ETB",
+    }).encode()
+    signature = main_module._compute_chapa_body_signature("webhook-test-secret", body)
+    monkeypatch.setattr(
+        main_module,
+        "_request_chapa_verification",
+        lambda reference: {
+            "tx_ref": reference,
+            "amount": Decimal("200.00"),
+            "currency": "ETB",
+            "status": "Successful",
+        },
+    )
+    monkeypatch.setenv("CHAPA_WEBHOOK_SECRET", "webhook-test-secret")
+
+    webhook = client.post(
+        "/api/payment/webhook",
+        content=body,
+        headers={"content-type": "application/json", "x-chapa-signature": signature},
+    )
+    assert webhook.status_code == 200, webhook.text
+    assert webhook.json()["settled"] is True
+    replay = client.post(
+        "/api/payment/webhook",
+        content=body,
+        headers={"content-type": "application/json", "x-chapa-signature": signature},
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["settled"] is False
+
+    with session_factory() as db:
+        order = db.query(Order).one()
+        transaction = db.query(Transaction).filter_by(tx_id=tx_ref).one()
+        assert order.status == "Completed"
+        assert order.payment_status == "Successful"
+        assert order.seller_commission == Decimal("2.00")
+        assert transaction.status == "Successful"
+        assert db.query(Wallet).filter_by(student_id="seller-1").one().balance == Decimal("0.00")
+        assert db.query(Wallet).filter_by(student_id="buyer-1").one().balance == Decimal("500.00")
+        commission_balance = db.query(SystemSetting).filter_by(key="system_wallet_balance").one()
+        assert Decimal(commission_balance.value) == Decimal("2.00")
+
+
+def test_cart_total_matches_customer_checkout_total(market):
+    client, _session_factory, _product_id = market
+
+    response = client.get("/api/student/cart", params={"student_id": "buyer-1"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == body["subtotal"] == body["checkout_total"] == 300.0
+    assert body["platform_fee"] == 0.0
+    assert body["seller_commission"] == 30.0
+    assert body["items"][0]["platform_fee"] == 0.0
+
+
 def test_pay_summary_and_happy_path_create_completed_order_and_credit_seller(market):
     client, session_factory, product_id = market
     summary = client.get(
@@ -153,6 +577,8 @@ def test_pay_summary_and_happy_path_create_completed_order_and_credit_seller(mar
     )
     assert summary.status_code == 200
     assert summary.json()["total"] == "200.00"
+    assert summary.json()["checkout_total"] == "200.00"
+    assert summary.json()["seller_commission"] == "20.00"
     assert summary.json()["quantity_limit"] == 3
     assert summary.json()["seller_name"] == "Seller"
     assert summary.json()["wallet_balance"] == "500.00"

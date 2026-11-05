@@ -259,7 +259,7 @@ function OrderDetailsView({ order, role = 'buyer', loading = false, error = '', 
     : isRefunded
       ? 'This legacy order was refunded to the buyer.'
       : paymentSuccessful
-        ? 'The buyer paid the seller directly from their wallet.'
+        ? 'Payment was completed for this order.'
         : 'No payment has been recorded for this legacy order.';
   const submitSellerResponse = async (event) => {
     event.preventDefault();

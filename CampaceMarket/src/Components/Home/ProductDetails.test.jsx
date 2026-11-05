@@ -375,16 +375,17 @@ describe('ProductDetails guest actions', () => {
 
     render(<ProductDetails product={product} currentUser={{ studentId: 'buyer-1' }} />);
 
-    fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with wallet' }))[0]);
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with Chapa' }))[0]);
 
     expect((await screen.findByRole('alert')).textContent).toContain('This item is out of stock.');
     await waitFor(() => expect(screen.getAllByText('Sold out').length).toBeGreaterThan(0));
-    expect(screen.queryByRole('button', { name: 'Pay with wallet' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Pay with Chapa' })).toBeNull();
   });
 
-  it('shows an incorrect PIN toast, clears the input, and keeps checkout focused', async () => {
+  it('shows Chapa checkout initialization errors without marking the cart complete', async () => {
     mockCartItems.push({ id: 8, product_id: 42, student_id: 'buyer-1', quantity: 1 });
-    const toastError = vi.spyOn(toast, 'error');
+    const checkoutWindow = { location: { href: '' }, opener: {}, close: vi.fn() };
+    vi.spyOn(window, 'open').mockReturnValue(checkoutWindow);
     const fetchMock = vi.fn((input) => {
       const url = String(input);
       if (url.includes('/api/products/42/pay-summary')) {
@@ -394,16 +395,12 @@ describe('ProductDetails guest actions', () => {
           total: '1000.00',
           quantity_limit: 1,
           seller_name: 'Seller',
-          wallet_balance: '2000.00',
-          has_wallet_pin: true,
         }));
       }
-      if (url.endsWith('/api/products/42/pay')) {
+      if (url.endsWith('/api/products/42/checkout')) {
         return Promise.resolve(jsonResponse({
-          detail: 'Incorrect Wallet PIN',
-          error_code: 'INCORRECT_PIN',
-          remaining_attempts: 3,
-        }, 400));
+          detail: 'Seller must complete payout setup.',
+        }, 409));
       }
       if (url.includes('/api/products/42/similar')) return Promise.resolve(jsonResponse([]));
       if (/\/api\/products\/42(?:\?track_view=false)?$/.test(url)) return Promise.resolve(jsonResponse(detail));
@@ -415,23 +412,19 @@ describe('ProductDetails guest actions', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<ProductDetails product={product} currentUser={{ studentId: 'buyer-1' }} />);
 
-    fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with wallet' }))[0]);
-    const pinInput = await screen.findByLabelText('Enter your 4-digit Wallet PIN');
-    fireEvent.change(pinInput, { target: { value: '0000' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Pay 1000.00 ETB' }));
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with Chapa' }))[0]);
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue to Chapa · 1000.00 ETB' }));
 
-    await waitFor(() => {
-      expect(toastError).toHaveBeenCalledWith('Incorrect Wallet PIN. Please try again.');
-      expect(screen.getByLabelText('Enter your 4-digit Wallet PIN').value).toBe('');
-      expect(document.activeElement).toBe(screen.getByLabelText('Enter your 4-digit Wallet PIN'));
-    });
-    expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.getByRole('heading', { name: 'Pay with wallet' })).toBeTruthy();
+    expect((await screen.findByRole('alert')).textContent).toContain('Seller must complete payout setup.');
+    expect(screen.getByRole('heading', { name: 'Pay with Chapa' })).toBeTruthy();
+    expect(checkoutWindow.close).toHaveBeenCalledOnce();
+    expect(mockMarkCheckoutComplete).not.toHaveBeenCalled();
   });
 
-  it('sets a Wallet PIN before checkout when the account does not have one', async () => {
+  it('opens Chapa checkout without requiring a Wallet PIN', async () => {
     mockCartItems.push({ id: 8, product_id: 42, student_id: 'buyer-1', quantity: 1 });
-    let hasWalletPin = false;
+    const checkoutWindow = { location: { href: '' }, opener: {}, close: vi.fn() };
+    vi.spyOn(window, 'open').mockReturnValue(checkoutWindow);
     const fetchMock = vi.fn((input) => {
       const url = String(input);
       if (url.includes('/api/products/42/pay-summary')) {
@@ -439,18 +432,16 @@ describe('ProductDetails guest actions', () => {
           title: 'Test phone',
           unit_price: '1000.00',
           total: '1000.00',
+          seller_commission: '10.00',
           quantity_limit: 1,
           seller_name: 'Seller',
-          wallet_balance: '2000.00',
-          has_wallet_pin: hasWalletPin,
         }));
       }
-      if (url.endsWith('/api/wallet/set-pin')) {
-        hasWalletPin = true;
-        return Promise.resolve(jsonResponse({ has_wallet_pin: true }));
-      }
-      if (url.endsWith('/api/products/42/pay')) {
-        return Promise.resolve(jsonResponse({ order_id: 123, status: 'Completed' }));
+      if (url.endsWith('/api/products/42/checkout')) {
+        return Promise.resolve(jsonResponse({
+          checkout_url: 'https://checkout.chapa.test/tx',
+          order_id: 123,
+        }));
       }
       if (url.includes('/api/products/42/similar')) return Promise.resolve(jsonResponse([]));
       if (/\/api\/products\/42(?:\?track_view=false)?$/.test(url)) return Promise.resolve(jsonResponse(detail));
@@ -465,23 +456,22 @@ describe('ProductDetails guest actions', () => {
       currentUser={{ studentId: 'buyer-1', is_verified: true, access_token: 'student-token' }}
     />);
 
-    fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with wallet' }))[0]);
-    expect(await screen.findByRole('heading', { name: 'Set Wallet PIN' })).toBeTruthy();
-    fireEvent.change(await screen.findByLabelText('Choose a 4-digit PIN'), { target: { value: '2468' } });
-    fireEvent.change(screen.getByLabelText('Confirm your Wallet PIN'), { target: { value: '2468' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Set Wallet PIN' }));
+    expect(screen.getByText('Make sure you have inspected the product in person before completing the payment.')).toBeTruthy();
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with Chapa' }))[0]);
+    expect(await screen.findByRole('heading', { name: 'Pay with Chapa' })).toBeTruthy();
+    expect(screen.getAllByText('Make sure you have inspected the product in person before completing the payment.')).toHaveLength(2);
+    expect(screen.getByText('10.00 ETB')).toBeTruthy();
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue to Chapa · 1000.00 ETB' }));
 
-    const pinInput = await screen.findByLabelText('Enter your 4-digit Wallet PIN');
-    fireEvent.change(pinInput, { target: { value: '2468' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Pay 1000.00 ETB' }));
-
-    expect(await screen.findByText(/Payment completed\. Order #123/)).toBeTruthy();
-    expect(mockMarkCheckoutComplete).toHaveBeenCalledOnce();
-    const paymentRequest = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/products/42/pay'));
-    expect(JSON.parse(paymentRequest[1].body)).toEqual({ pin: '2468', quantity: 1 });
+    await waitFor(() => expect(checkoutWindow.location.href).toBe('https://checkout.chapa.test/tx'));
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/wallet/set-pin'))).toBe(false);
+    expect(mockMarkCheckoutComplete).not.toHaveBeenCalled();
+    const paymentRequest = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/products/42/checkout'));
+    expect(paymentRequest[1].method).toBe('POST');
+    expect(JSON.parse(paymentRequest[1].body)).toEqual({ quantity: 1 });
   });
 
-  it('resets a forgotten Wallet PIN using email OTP without leaving checkout', async () => {
+  it('does not expose wallet PIN recovery in product checkout', async () => {
     mockCartItems.push({ id: 8, product_id: 42, student_id: 'buyer-1', quantity: 1 });
     const fetchMock = vi.fn((input) => {
       const url = String(input);
@@ -492,15 +482,7 @@ describe('ProductDetails guest actions', () => {
           total: '1000.00',
           quantity_limit: 1,
           seller_name: 'Seller',
-          wallet_balance: '2000.00',
-          has_wallet_pin: true,
         }));
-      }
-      if (url.endsWith('/api/wallet/pin-reset/request')) {
-        return Promise.resolve(jsonResponse({ message: 'A code was sent.', retry_after_seconds: 60 }));
-      }
-      if (url.endsWith('/api/wallet/pin-reset/confirm')) {
-        return Promise.resolve(jsonResponse({ has_wallet_pin: true }));
       }
       if (url.includes('/api/products/42/similar')) return Promise.resolve(jsonResponse([]));
       if (/\/api\/products\/42(?:\?track_view=false)?$/.test(url)) return Promise.resolve(jsonResponse(detail));
@@ -515,19 +497,10 @@ describe('ProductDetails guest actions', () => {
       currentUser={{ studentId: 'buyer-1', is_verified: true, access_token: 'student-token' }}
     />);
 
-    fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with wallet' }))[0]);
-    fireEvent.click(await screen.findByRole('button', { name: 'Forgot Wallet PIN?' }));
-    expect(await screen.findByRole('heading', { name: 'Reset Wallet PIN' })).toBeTruthy();
-    fireEvent.change(screen.getByLabelText('Email verification code'), { target: { value: '123456' } });
-    fireEvent.change(screen.getByLabelText('New 4-digit Wallet PIN'), { target: { value: '2468' } });
-    fireEvent.change(screen.getByLabelText('Confirm new Wallet PIN'), { target: { value: '2468' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Reset Wallet PIN' }));
-
-    expect(await screen.findByLabelText('Enter your 4-digit Wallet PIN')).toBeTruthy();
-    const request = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/wallet/pin-reset/request'));
-    const confirmation = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/wallet/pin-reset/confirm'));
-    expect(request[1].headers.Authorization).toBe('Bearer student-token');
-    expect(JSON.parse(confirmation[1].body)).toEqual({ otp_code: '123456', pin: '2468' });
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Pay with Chapa' }))[0]);
+    expect(await screen.findByRole('heading', { name: 'Pay with Chapa' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Wallet PIN/ })).toBeNull();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/wallet/pin-reset/'))).toBe(false);
   });
 
   it.each([

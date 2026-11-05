@@ -68,6 +68,9 @@ class StudentSessionTests(unittest.TestCase):
     def test_cors_allows_local_vite_credentials_methods_and_headers(self):
         cors = next(item for item in main_module.app.user_middleware if item.cls is CORSMiddleware)
         self.assertIn("http://localhost:5173", cors.kwargs["allow_origins"])
+        self.assertIn("http://127.0.0.1:5173", cors.kwargs["allow_origins"])
+        for origin in ("http://localhost:5174", "http://127.0.0.1:5174"):
+            self.assertRegex(origin, cors.kwargs["allow_origin_regex"])
         self.assertTrue(cors.kwargs["allow_credentials"])
         self.assertEqual(cors.kwargs["allow_methods"], ["*"])
         self.assertEqual(cors.kwargs["allow_headers"], ["*"])

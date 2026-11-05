@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from app import main as main_module
 from app.database import Base
-from app.models import Order, Product, Student, UserSession
+from app.models import Order, Product, Student, Transaction, UserSession
 from app.password_security import hash_password
 
 
@@ -171,10 +171,33 @@ class SellerOrderEndpointTests(unittest.TestCase):
         self.assertEqual(other_seller_response.status_code, 200)
         self.assertEqual(other_seller_response.json()["items"], [])
 
-    def test_seller_cannot_access_buyer_receipt(self):
+    def test_seller_can_view_receipt_for_paid_order_with_paid_transaction_status(self):
+        self.order.id = 61
+        self.db.flush()
+        tx_ref = f"CHAPA-ORDER-{self.order.id}"
+        self.db.add(Transaction(
+            student_id=self.buyer.student_id,
+            tx_id=tx_ref,
+            type="Product Purchase",
+            amount=100,
+            description=f"Chapa split payment for order #{self.order.id}",
+            status="Paid",
+        ))
+        self.db.commit()
         response = self.client.get(
             f"/api/student/orders/{self.order.id}/receipt",
             headers={"Authorization": f"Bearer {self.seller_token}"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["order_number"], self.order.id)
+        self.assertEqual(response.json()["transaction_reference"], tx_ref)
+
+    def test_unrelated_seller_cannot_access_receipt(self):
+        other_token = self.other_seller_token
+        response = self.client.get(
+            f"/api/student/orders/{self.order.id}/receipt",
+            headers={"Authorization": f"Bearer {other_token}"},
         )
 
         self.assertEqual(response.status_code, 403)

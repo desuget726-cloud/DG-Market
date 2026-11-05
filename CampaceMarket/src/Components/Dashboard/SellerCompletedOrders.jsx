@@ -137,7 +137,10 @@ function SellerCompletedOrders({
                 </tr>
               </thead>
               <tbody>
-                {items.map((order) => (
+                {items.map((order) => {
+                  const paymentReceived = ['successful', 'success', 'paid', 'completed']
+                    .includes(String(order.payment_status || '').trim().toLowerCase());
+                  return (
                   <tr
                     key={order.id}
                     role="link"
@@ -154,8 +157,18 @@ function SellerCompletedOrders({
                     <td className="whitespace-nowrap px-4 py-3 text-slate-700">{order.product_title}</td>
                     <td className="whitespace-nowrap px-4 py-3 font-bold text-slate-900">{formatAmount(order.amount, language)}</td>
                     <td className="whitespace-nowrap px-4 py-3">
-                      <span className="inline-flex rounded-full border border-emerald-200 bg-emerald-100 px-2.5 py-1 text-[11px] font-bold text-emerald-700">
-                        {t('sellerOrders.sold')}
+                      <span
+                        role="status"
+                        aria-live="polite"
+                        className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-bold ${
+                          paymentReceived
+                            ? 'border-emerald-200 bg-emerald-100 text-emerald-800'
+                            : 'border-amber-200 bg-amber-100 text-amber-900'
+                        }`}
+                      >
+                        {paymentReceived
+                          ? 'Payment Received / Order Settled'
+                          : `Payment ${String(order.payment_status || 'Pending').toLowerCase()}`}
                       </span>
                     </td>
                     <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-500">{formatDate(order.completed_at, language)}</td>
@@ -172,7 +185,8 @@ function SellerCompletedOrders({
                       </button>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

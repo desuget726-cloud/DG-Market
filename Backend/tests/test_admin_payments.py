@@ -103,6 +103,28 @@ class AdminPaymentsEndpointTests(unittest.TestCase):
 
         self.assertEqual(payment["seller_id"], self.seller.student_id)
         self.assertEqual(payment["order_id"], order.id)
+        self.assertEqual(payment["payment_method"], "Wallet")
+
+    def test_chapa_product_payment_is_displayed_as_chapa(self):
+        order = self.create_order()
+        transaction = Transaction(
+            student_id=self.buyer.student_id,
+            wallet_id=None,
+            tx_id="TX-CHAPA-PRODUCT-1",
+            type="Product Purchase",
+            amount=Decimal("100.00"),
+            description=f"Chapa split payment for order #{order.id}",
+            status="Pending",
+        )
+        self.db.add(transaction)
+        self.db.flush()
+
+        payment = self.get_payment(transaction.tx_id)
+
+        self.assertEqual(payment["seller_id"], self.seller.student_id)
+        self.assertEqual(payment["order_id"], order.id)
+        self.assertEqual(payment["payment_method"], "Chapa")
+        self.assertEqual(payment["chapa_reference"], transaction.tx_id)
 
     def test_payout_uses_wallet_owner_and_is_not_an_order(self):
         transaction = Transaction(

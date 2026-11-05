@@ -93,6 +93,8 @@ class GoogleOAuthTests(unittest.TestCase):
             "_get_setting_value",
             side_effect=lambda _db, block, key, default=None: setting_values.get((block, key), default),
         ), patch.object(
+            main_module, "_audit_logging_enabled", return_value=False
+        ), patch.object(
             main_module, "_get_session_secret", return_value="test-session-secret"
         ), patch.object(
             main_module, "_create_session_token", return_value="mock-session-token"
@@ -174,7 +176,11 @@ class GoogleOAuthTests(unittest.TestCase):
                 main_module,
                 "_get_or_create_oauth_student",
                 return_value=object(),
-            ), patch.object(main_module, "_create_secure_session_for_student"):
+            ), patch.object(
+                main_module,
+                "_create_secure_session_for_student",
+                return_value={"access_token": "mock-session-token"},
+            ):
                 response = asyncio.run(main_module.google_callback(
                     code="test-code",
                     state="test-state",
@@ -188,7 +194,7 @@ class GoogleOAuthTests(unittest.TestCase):
         self.assertEqual(exchanged_payload["code_verifier"], "test-verifier")
         self.assertEqual(
             response.headers["location"],
-            f"{environment['FRONTEND_URL']}/login?oauth=success",
+            f"{environment['FRONTEND_URL']}/login?oauth=success#access_token=mock-session-token",
         )
 
     def test_expired_state_redirects_to_frontend(self):
@@ -222,7 +228,7 @@ class GoogleOAuthTests(unittest.TestCase):
 
         self.assertEqual(
             response.headers["location"],
-            "https://frontend.example.test/login?oauth=success",
+            "https://frontend.example.test/login?oauth=success#access_token=mock-session-token",
         )
         self.assertIn("session_token=mock-session-token", response.headers["set-cookie"])
         self.assertIn("SameSite=none", response.headers["set-cookie"])
@@ -231,6 +237,15 @@ class GoogleOAuthTests(unittest.TestCase):
             self.db.query(UserSession).filter_by(user_id=student.student_id).count(),
             1,
         )
+
+    def test_local_http_oauth_cookie_is_not_forced_secure(self):
+        for frontend_url in ("http://localhost:5173", "http://127.0.0.1:5173"):
+            with self.subTest(frontend_url=frontend_url), patch.dict(
+                os.environ,
+                {"FRONTEND_URL": frontend_url, "COOKIE_SECURE": "true"},
+                clear=True,
+            ):
+                self.assertFalse(main_module._oauth_cookie_secure())
 
     def test_new_allowed_user_is_created_using_auto_approval_setting(self):
         response, _ = self._run_callback({
@@ -242,7 +257,10 @@ class GoogleOAuthTests(unittest.TestCase):
         student = self.db.query(Student).filter_by(email="new@university.edu.et").one()
         self.assertTrue(student.is_verified)
         self.assertEqual(student.status, "Pending Verification")
-        self.assertEqual(response.headers["location"], "https://frontend.example.test/login?oauth=success")
+        self.assertEqual(
+            response.headers["location"],
+            "https://frontend.example.test/login?oauth=success#access_token=mock-session-token",
+        )
         self.assertEqual(self.db.query(Wallet).filter_by(student_id=student.student_id).count(), 1)
         self.assertEqual(self.db.query(UserSession).filter_by(user_id=student.student_id).count(), 1)
 

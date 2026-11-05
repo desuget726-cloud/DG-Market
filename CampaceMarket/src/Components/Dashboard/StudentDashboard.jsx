@@ -1,7 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import toast from 'react-hot-toast';
-import jsPDF from 'jspdf';
-import autoTable from 'jspdf-autotable';
 import { ArrowDownLeft, ArrowUpRight, Check, ChevronDown, Copy, Pencil, Search, Wallet, X } from 'lucide-react';
 import { useLanguage } from '../../context/LanguageContext';
 import { useCart } from '../../context/CartContext';
@@ -16,6 +14,7 @@ import BuyerHubProductCard from './BuyerHubProductCard';
 import { API_BASE_URL, IMAGE_PLACEHOLDER, resolveImageUrl, WS_BASE_URL } from '../../config';
 import { getAdminSettings } from '../../api/adminSettings';
 import { isOrderRefunded } from '../../utils/orderReceiptState';
+import { buildPaymentReceiptPdf, paymentReceiptPdfFilename } from '../../utils/paymentReceiptPdf';
 import { shouldReduceUnreadNotificationCount } from '../../utils/notificationState';
 import { buildOrderDashboardUrl, parseOrderDashboardLink } from '../../utils/orderDashboardLink';
 import { filterPublicProducts } from '../../utils/publicListings';
@@ -1232,127 +1231,6 @@ function StudentDashboard({
     return undefined;
   }, [printingReceiptOrderId, paymentReceiptState]);
 
-  const buildReceiptPdf = (receipt, includeBuyerEmail = false) => {
-    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-    const money = (value) => `${Number(value || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ETB`;
-    const date = receipt.payment_date || receipt.order_date;
-    const dateText = date ? new Date(date).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Date unavailable';
-    const rows = [
-      ['Receipt #', receipt.receipt_number],
-      ['Order #', `#${receipt.order_number}`],
-      ['Paid on', dateText],
-      ['Product', receipt.product_name],
-      ['Quantity', String(receipt.quantity)],
-      ['Unit price', money(receipt.unit_price)],
-      ['Item total', money(receipt.item_total)],
-      [receipt.platform_commission_label || 'Platform commission', money(receipt.fees)],
-      ['Total paid', money(receipt.total_paid)],
-      ['Payment method', receipt.payment_method],
-      ['Reference', receipt.transaction_reference],
-      ['Buyer', receipt.buyer_name],
-      ...(includeBuyerEmail ? [['Buyer Email', receipt.buyer_email || 'N/A']] : []),
-      ['Seller', receipt.seller_name],
-      ['Order status', String(receipt.order_status || '').toUpperCase()],
-      ['Payment status', String(receipt.payment_status || '').toUpperCase()],
-    ];
-    if (receipt.dispute_status) rows.push(['Dispute', receipt.dispute_status]);
-    if (receipt.refund_amount !== null && receipt.refund_amount !== undefined) {
-      rows.push(['Refund', `${money(receipt.refund_amount)}${receipt.refund_reference ? ` (${receipt.refund_reference})` : ''}`]);
-    }
-    const tableRows = [];
-    for (let index = 0; index < rows.length; index += 2) {
-      const first = rows[index];
-      const second = rows[index + 1] || ['', ''];
-      tableRows.push([
-        first[0], String(first[1] || 'Unavailable'),
-        second[0], String(second[1] || ''),
-      ]);
-    }
-
-    pdf.setFillColor(22, 34, 79);
-    pdf.roundedRect(10, 10, 190, 34, 2, 2, 'F');
-    pdf.setFillColor(110, 231, 183);
-    pdf.roundedRect(17, 18, 14, 14, 2, 2, 'F');
-    pdf.setFont('helvetica', 'bold');
-    pdf.setFontSize(10);
-    pdf.setTextColor(22, 34, 79);
-    pdf.text('UX', 24, 26.5, { align: 'center' });
-    pdf.setTextColor(255, 255, 255);
-    pdf.setFontSize(19);
-    pdf.text('UniXchange', 37, 24);
-    pdf.setFontSize(8);
-    pdf.setTextColor(203, 213, 225);
-    pdf.text('PAYMENT RECEIPT', 37, 32);
-    pdf.setFillColor(209, 250, 229);
-    pdf.roundedRect(148, 19, 44, 10, 2, 2, 'F');
-    pdf.setFontSize(7.5);
-    pdf.setTextColor(6, 95, 70);
-    pdf.text('PAYMENT SUCCESSFUL', 170, 25.5, { align: 'center' });
-
-    autoTable(pdf, {
-      startY: 51,
-      margin: { left: 10, right: 10 },
-      theme: 'grid',
-      body: tableRows,
-      styles: {
-        font: 'helvetica',
-        fontSize: 8,
-        cellPadding: 2.5,
-        lineColor: [226, 232, 240],
-        lineWidth: 0.2,
-        overflow: 'linebreak',
-        valign: 'middle',
-      },
-      columnStyles: {
-        0: { cellWidth: 29, fontStyle: 'bold', textColor: [100, 116, 139] },
-        1: { cellWidth: 66, textColor: [15, 23, 42] },
-        2: { cellWidth: 29, fontStyle: 'bold', textColor: [100, 116, 139] },
-        3: { cellWidth: 66, textColor: [15, 23, 42] },
-      },
-      alternateRowStyles: { fillColor: [248, 250, 252] },
-      didParseCell: ({ cell, row }) => {
-        const isTotalRow = row.raw[0] === 'Total paid' || row.raw[2] === 'Total paid';
-        if (isTotalRow) {
-          cell.styles.fillColor = [209, 250, 229];
-          cell.styles.textColor = [6, 95, 70];
-          cell.styles.fontStyle = 'bold';
-        }
-      },
-    });
-
-    let y = pdf.lastAutoTable.finalY + 8;
-    const paymentMessage = String(receipt.payment_message || 'Keep this receipt for your records.');
-    const messageLines = pdf.splitTextToSize(paymentMessage, 176);
-    const noteHeight = Math.max(18, messageLines.length * 4 + 8);
-    if (y + noteHeight + 20 > 287) {
-      pdf.addPage();
-      y = 18;
-    }
-    pdf.setFillColor(248, 250, 252);
-    pdf.roundedRect(10, y, 190, noteHeight, 2, 2, 'F');
-    pdf.setFont('helvetica', 'normal');
-    pdf.setFontSize(8.5);
-    pdf.setTextColor(71, 85, 105);
-    pdf.text(messageLines, 17, y + 7);
-    y += noteHeight + 8;
-    pdf.setDrawColor(203, 213, 225);
-    pdf.line(10, y, 200, y);
-    pdf.setFont('helvetica', 'bold');
-    pdf.setFontSize(10);
-    pdf.setTextColor(22, 34, 79);
-    pdf.text('Thank you for using UniXchange', 105, y + 6, { align: 'center' });
-    pdf.setFont('helvetica', 'normal');
-    pdf.setFontSize(8);
-    pdf.setTextColor(100, 116, 139);
-    const supportLine = `Questions or support: ${receiptSupportEmail}`;
-    pdf.text(supportLine, 105, y + 11, { align: 'center' });
-    const supportLineWidth = pdf.getTextWidth(supportLine);
-    pdf.link(105 - supportLineWidth / 2, y + 7, supportLineWidth, 5, {
-      url: `mailto:${encodeURIComponent(receiptSupportEmail)}`,
-    });
-    return pdf;
-  };
-
   const handleViewPaymentReceipt = async (orderId) => {
     if (isReceiptUnavailable(orderId)) return;
     if (!paymentReceiptState[orderId]?.data) await fetchPaymentReceipt(orderId);
@@ -1361,7 +1239,7 @@ function StudentDashboard({
   const handleDownloadPaymentReceipt = async (orderId) => {
     if (isReceiptUnavailable(orderId)) return;
     const receipt = paymentReceiptState[orderId]?.data || await fetchPaymentReceipt(orderId);
-    buildReceiptPdf(receipt, true).save(`UniXchange-Order-${receipt.order_number}-Receipt.pdf`);
+    buildPaymentReceiptPdf(receipt).save(paymentReceiptPdfFilename(receipt.order_number));
   };
 
   const handlePrintPaymentReceipt = async (orderId) => {
@@ -1520,7 +1398,9 @@ function StudentDashboard({
     if (typeof window === 'undefined' || paymentVerificationStartedRef.current) return;
 
     const callbackUrl = new URL(window.location.href);
-    let transactionReference = callbackUrl.searchParams.get('trx_ref') || callbackUrl.searchParams.get('tx_ref');
+    let transactionReference = callbackUrl.searchParams.get('trx_ref')
+      || callbackUrl.searchParams.get('tx_ref')
+      || callbackUrl.searchParams.get('ref_id');
     const returnedSuccessfully = ['success', 'successful', 'completed'].includes(
       String(callbackUrl.searchParams.get('status') || '').trim().toLowerCase(),
     );
@@ -1610,9 +1490,42 @@ function StudentDashboard({
               ? 'Failed'
               : 'Pending';
 
-          await refreshWalletLedger();
+          const isProductPayment = data?.transaction_type === 'Product Purchase' || data?.order_id !== undefined;
+          if (!isProductPayment) await refreshWalletLedger();
 
           if (response.ok && status === 'Successful') {
+            if (isProductPayment) {
+              if (data?.order?.id !== undefined) {
+                setOrders((currentOrders) => {
+                  const existingOrder = currentOrders.some(
+                    (order) => String(order.id) === String(data.order.id),
+                  );
+                  return existingOrder
+                    ? currentOrders.map((order) => (
+                      String(order.id) === String(data.order.id) ? data.order : order
+                    ))
+                    : [data.order, ...currentOrders];
+                });
+              }
+              await fetchBuyerDashboardData();
+              if (!isMounted) break;
+              setBuyerTab('orders');
+              setPaymentVerificationState('successful');
+              notifySuccess(
+                `Product payment confirmed${data.order_id ? ` for order #${data.order_id}` : ''}.`,
+                `student-product-payment-confirmed-${transactionReference}`,
+              );
+              callbackUrl.searchParams.delete('trx_ref');
+              callbackUrl.searchParams.delete('tx_ref');
+              callbackUrl.searchParams.delete('status');
+              window.history.replaceState(
+                {},
+                document.title,
+                `${callbackUrl.pathname}${callbackUrl.search}${callbackUrl.hash}`,
+              );
+              break;
+            }
+
             const verifiedBalance = Number(data?.wallet_balance ?? data?.walletBalance ?? data?.balance);
             if (Number.isFinite(verifiedBalance)) {
               walletBalanceRef.current = verifiedBalance;
@@ -5036,51 +4949,6 @@ function StudentDashboard({
               );
             })}
           </nav>
-
-          <section
-            aria-label="Wallet balance and actions"
-            className={`mt-auto m-3 mb-4 shrink-0 rounded-2xl border border-slate-700/50 bg-[#0f172a]/90 p-4 shadow-md ${isSidebarCollapsed ? 'lg:m-1 lg:mb-2 lg:w-full lg:px-1.5 lg:py-2' : ''}`}
-          >
-            <div className={`flex items-center justify-between gap-1 ${isSidebarCollapsed ? 'lg:flex-col lg:gap-1' : ''}`}>
-              <span className={`text-[11px] font-semibold tracking-wider text-slate-400 ${isSidebarCollapsed ? 'lg:hidden' : ''}`}>WALLET</span>
-              <span className="shrink-0 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-bold text-emerald-400">LIVE</span>
-            </div>
-            <div className={`mt-2 mb-4 flex items-baseline justify-between gap-1 ${isSidebarCollapsed ? 'lg:my-1 lg:flex-col lg:items-center' : ''}`} title={formatETB(currentWalletBalance)}>
-              <span className={`text-xs font-bold text-slate-400 ${isSidebarCollapsed ? 'lg:hidden' : ''}`}>ETB</span>
-              <span className={`ml-auto truncate text-xl font-extrabold tracking-tight text-white ${isSidebarCollapsed ? 'lg:ml-0 lg:text-[9px]' : ''}`}>
-                {(Number.isFinite(Number(currentWalletBalance ?? 0)) ? Number(currentWalletBalance ?? 0) : 0)
-                  .toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-              </span>
-            </div>
-            <div className={`grid w-full grid-cols-2 gap-2.5 ${isSidebarCollapsed ? 'lg:gap-1' : ''}`}>
-              <button
-                type="button"
-                aria-label="Add Funds"
-                title="Add Funds"
-                onClick={() => {
-                  setDepositError('');
-                  setShowDepositModal(true);
-                }}
-                className={`flex items-center justify-center whitespace-nowrap rounded-xl border border-emerald-500/50 bg-slate-900/60 px-3 py-2 text-xs font-bold text-emerald-300 shadow-sm transition hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300 ${isSidebarCollapsed ? 'lg:px-1 lg:text-[9px]' : ''}`}
-              >
-                Add Funds
-              </button>
-              <button
-                type="button"
-                aria-label="Withdraw"
-                disabled={withdrawLoading || withdrawalEntryBlocked}
-                title={activeWithdrawal ? 'A payout is currently processing' : currentWalletBalance <= 0 ? 'Add funds before withdrawing' : 'Withdraw funds'}
-                onClick={() => {
-                  setWithdrawError('');
-                  setWithdrawPin('');
-                  setShowWithdrawModal(true);
-                }}
-                className={`flex items-center justify-center whitespace-nowrap rounded-xl border border-amber-500/50 bg-slate-900/60 px-3 py-2 text-xs font-bold text-amber-300 shadow-sm transition hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 disabled:cursor-not-allowed disabled:opacity-50 ${isSidebarCollapsed ? 'lg:px-1 lg:text-[9px]' : ''}`}
-              >
-                Withdraw
-              </button>
-            </div>
-          </section>
 
         </aside>
 

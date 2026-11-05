@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from app import main as main_module
 from app.database import Base
-from app.models import Order, Product, Student, Transaction, UserSession
+from app.models import Order, PaymentIdempotency, Product, Student, Transaction, UserSession
 from app.password_security import hash_password
 
 
@@ -126,3 +126,35 @@ class LegacyOrderHistoryTests(unittest.TestCase):
         self.assertEqual(response.json()["order_number"], self.order.id)
         self.assertEqual(response.json()["payment_method"], "Escrow Hold")
         self.assertEqual(response.json()["payment_message"], "This is a legacy order with escrow payment history.")
+
+    def test_chapa_order_receipt_matches_transaction_by_payment_reference(self):
+        tx_ref = "TX-CHAPA-ORDER-60"
+        self.db.add(Transaction(
+            student_id=self.buyer.student_id,
+            wallet_id=None,
+            tx_id=tx_ref,
+            type="Product Purchase",
+            amount=Decimal("100.00"),
+            description=f"Chapa split payment for order #{self.order.id}",
+            status="Successful",
+        ))
+        self.db.add(PaymentIdempotency(
+            idempotency_key=f"chapa-product:{tx_ref}",
+            order_id=self.order.id,
+            buyer_id=self.buyer.student_id,
+            product_id=self.product.id,
+            transaction_id=tx_ref,
+        ))
+        self.db.commit()
+
+        response = self.client.get(
+            f"/api/student/orders/{self.order.id}/receipt",
+            headers={"Authorization": f"Bearer {self.buyer_token}"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        receipt = response.json()
+        self.assertEqual(receipt["payment_method"], "Chapa Split Payment")
+        self.assertEqual(receipt["transaction_reference"], tx_ref)
+        self.assertEqual(receipt["total_paid"], 100.0)
+        self.assertEqual(receipt["payment_message"], "The buyer paid through Chapa Split Payment.")

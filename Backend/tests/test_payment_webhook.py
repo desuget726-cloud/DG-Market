@@ -18,6 +18,24 @@ from sqlalchemy.pool import StaticPool
 
 
 class PaymentWebhookTests(unittest.TestCase):
+    def test_get_callback_passes_authorization_and_database_by_keyword(self):
+        database = object()
+        with patch.object(main_module, "verify_payment_with_chapa", return_value={"success": True}) as verify:
+            result = asyncio.run(
+                main_module.acknowledge_chapa_get_callback(
+                    tx_ref="TX-CALLBACK",
+                    authorization="Bearer callback-token",
+                    db=database,
+                )
+            )
+
+        self.assertEqual(result, {"success": True})
+        verify.assert_called_once_with(
+            "TX-CALLBACK",
+            authorization="Bearer callback-token",
+            db=database,
+        )
+
     def test_signed_pending_callback_is_acknowledged_without_settlement(self):
         secret = "webhook-test-secret"
         body = json.dumps({"status": "pending", "tx_ref": "TX-PENDING"}).encode()

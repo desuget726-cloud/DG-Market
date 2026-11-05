@@ -42,7 +42,7 @@ export default function ProductPurchaseActions({
             disabled={payDisabled}
             className={payButtonClassName}
           >
-            Pay with wallet
+            Pay with Chapa
           </button>
         </>
       ) : (

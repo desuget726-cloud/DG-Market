@@ -587,6 +587,7 @@ function SellerOperationsCenter({
         onRetry={() => fetchSellerOrderDetails(selectedOrder.id)}
         onDisputeResponse={respondToDispute}
         onOpenChat={onOpenSellerChat}
+        sessionToken={sessionToken}
       />
     );
   }

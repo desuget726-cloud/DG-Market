@@ -43,6 +43,7 @@ const renderOrders = (onOpenOrder) => render(
         buyer_name: 'Aster Buyer',
         product_title: 'Campus Textbook',
         amount: 125,
+        payment_status: 'Successful',
         completed_at: '2026-10-20T12:00:00',
       }],
       total: 1,
@@ -79,6 +80,7 @@ describe('SellerCompletedOrders', () => {
     renderOrders(onOpenOrder);
 
     await user.click(screen.getByRole('link', { name: 'View completed order #41' }));
+    expect(screen.getByRole('status')).toHaveTextContent('Payment Received / Order Settled');
     expect(onOpenOrder).toHaveBeenCalledWith(41);
 
     onOpenOrder.mockClear();
