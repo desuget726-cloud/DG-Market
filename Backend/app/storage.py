@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 import cloudinary
 import cloudinary.uploader
@@ -128,6 +129,55 @@ def save_upload(
         max_size_bytes=max_size_bytes,
         resource_type="image",
     )
+
+
+def delete_upload(url: str, folder: str) -> bool:
+    """Delete an upload only when its URL belongs to the requested storage folder."""
+    local_folder = LOCAL_FOLDER_MAP.get(folder)
+    if not local_folder:
+        raise ValueError(f"Unsupported upload folder: {folder}")
+
+    parsed_url = urlsplit(str(url or "").strip())
+    path = unquote(parsed_url.path)
+    cloudinary_marker = "/image/upload/"
+    if parsed_url.hostname == "res.cloudinary.com" and cloudinary_marker in path:
+        if not _cloudinary_configured():
+            raise HTTPException(status_code=503, detail="Image storage service is not configured.")
+
+        encoded_public_id = path.split(cloudinary_marker, 1)[1]
+        public_id_parts = encoded_public_id.split("/")
+        if public_id_parts and re.fullmatch(r"v\d+", public_id_parts[0]):
+            public_id_parts = public_id_parts[1:]
+        if public_id_parts:
+            public_id_parts[-1] = Path(public_id_parts[-1]).stem
+        public_id = "/".join(public_id_parts)
+        if not public_id.startswith(f"{folder}/"):
+            return False
+
+        try:
+            result = cloudinary.uploader.destroy(public_id, resource_type="image")
+        except Exception as error:
+            logger.error("Cloudinary delete failed for folder %s (%s).", folder, type(error).__name__)
+            raise HTTPException(status_code=502, detail="Image storage service failed to remove the photo.") from error
+        if not isinstance(result, dict) or result.get("result") not in {"ok", "not found"}:
+            raise HTTPException(status_code=502, detail="Image storage service could not remove the photo.")
+        return True
+
+    local_prefix = f"/static/uploads/{local_folder}/"
+    if path.startswith(local_prefix):
+        filename = path[len(local_prefix):]
+        if not filename or os.path.basename(filename) != filename:
+            return False
+        root = os.path.realpath(os.path.join(STATIC_DIR, local_folder))
+        target = os.path.realpath(os.path.join(root, filename))
+        if os.path.commonpath([root, target]) != root:
+            return False
+        if os.path.isfile(target):
+            os.remove(target)
+            return True
+        return False
+
+    return False
 
 
 def save_attachment(

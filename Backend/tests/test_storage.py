@@ -77,5 +77,67 @@ class SaveUploadTests(unittest.TestCase):
         self.assertNotIn("private credential detail", raised.exception.detail)
 
 
+class DeleteUploadTests(unittest.TestCase):
+    def test_local_avatar_is_deleted_only_from_its_storage_folder(self):
+        with tempfile.TemporaryDirectory() as temporary_dir, patch.object(
+            storage,
+            "STATIC_DIR",
+            temporary_dir,
+        ):
+            avatar_dir = os.path.join(temporary_dir, "avatars")
+            os.makedirs(avatar_dir)
+            avatar_path = os.path.join(avatar_dir, "profile.webp")
+            with open(avatar_path, "wb") as avatar:
+                avatar.write(b"image-data")
+
+            deleted = storage.delete_upload(
+                "http://127.0.0.1:8000/static/uploads/avatars/profile.webp",
+                "campace/profiles",
+            )
+
+        self.assertTrue(deleted)
+        self.assertFalse(os.path.exists(avatar_path))
+
+    def test_cloudinary_avatar_is_deleted_from_its_expected_folder(self):
+        cloudinary_env = {
+            "CLOUDINARY_CLOUD_NAME": "test-cloud",
+            "CLOUDINARY_API_KEY": "test-key",
+            "CLOUDINARY_API_SECRET": "test-secret",
+        }
+        with patch.dict(os.environ, cloudinary_env, clear=True), patch.object(
+            storage.cloudinary.uploader,
+            "destroy",
+            return_value={"result": "ok"},
+        ) as cloudinary_destroy:
+            deleted = storage.delete_upload(
+                "https://res.cloudinary.com/test/image/upload/v123/campace/profiles/photo.webp",
+                "campace/profiles",
+            )
+
+        self.assertTrue(deleted)
+        cloudinary_destroy.assert_called_once_with(
+            "campace/profiles/photo",
+            resource_type="image",
+        )
+
+    def test_cloudinary_avatar_outside_expected_folder_is_not_deleted(self):
+        cloudinary_env = {
+            "CLOUDINARY_CLOUD_NAME": "test-cloud",
+            "CLOUDINARY_API_KEY": "test-key",
+            "CLOUDINARY_API_SECRET": "test-secret",
+        }
+        with patch.dict(os.environ, cloudinary_env, clear=True), patch.object(
+            storage.cloudinary.uploader,
+            "destroy",
+        ) as cloudinary_destroy:
+            deleted = storage.delete_upload(
+                "https://res.cloudinary.com/test/image/upload/v123/campace/products/photo.webp",
+                "campace/profiles",
+            )
+
+        self.assertFalse(deleted)
+        cloudinary_destroy.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

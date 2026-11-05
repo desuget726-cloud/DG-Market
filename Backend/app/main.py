@@ -110,7 +110,7 @@ from .ai_service import (
 )
 from .wallet_service import apply_transaction
 from .commission_service import DEFAULT_COMMISSION_SETTINGS, as_decimal, commission_fee_from_settings, validate_commission_settings
-from .storage import save_attachment, save_upload
+from .storage import delete_upload, save_attachment, save_upload
 
 logger = logging.getLogger(__name__)
 
@@ -9775,6 +9775,41 @@ async def upload_student_avatar(
         await image.close()
 
     return {"success": True, "imageUrl": image_url, "avatarUrl": image_url}
+
+
+@app.delete("/api/student/profile/avatar")
+def remove_student_avatar(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    student = _student_from_authorization(authorization, db)
+    stored_url = str(student.avatar_url or "").strip()
+    try:
+        if stored_url:
+            delete_upload(stored_url, "campace/profiles")
+
+        legacy_filename = f"{student.student_id}.jpg"
+        if os.path.basename(legacy_filename) == legacy_filename:
+            legacy_path = os.path.realpath(os.path.join(AVATAR_DIR, legacy_filename))
+            avatar_root = os.path.realpath(AVATAR_DIR)
+            if os.path.commonpath([avatar_root, legacy_path]) == avatar_root and os.path.isfile(legacy_path):
+                os.remove(legacy_path)
+
+        student.avatar_url = None
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except OSError as error:
+        db.rollback()
+        logging.getLogger("app.avatar").exception("Failed to remove student avatar file.")
+        raise HTTPException(status_code=500, detail="Failed to remove profile photo.") from error
+    except SQLAlchemyError as error:
+        db.rollback()
+        logging.getLogger("app.avatar").exception("Failed to update student avatar record.")
+        raise HTTPException(status_code=500, detail="Failed to remove profile photo.") from error
+
+    return {"success": True, "avatar_url": None, "message": "Profile photo removed."}
 
 
 @app.get("/api/student/profile")

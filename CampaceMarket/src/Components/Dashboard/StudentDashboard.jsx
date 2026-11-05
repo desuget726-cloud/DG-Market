@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import toast from 'react-hot-toast';
-import { ArrowDownLeft, ArrowUpRight, Check, ChevronDown, Copy, Pencil, Search, Wallet, X } from 'lucide-react';
+import { Check, ChevronDown, Copy, FileDown, MessageCircle, Pencil, Search, ShieldCheck, ShoppingBag, X } from 'lucide-react';
 import { useLanguage } from '../../context/LanguageContext';
 import { useCart } from '../../context/CartContext';
 import { getErrorMessage, notifyError, notifyInfo, notifySuccess } from '../../utils/notify';
@@ -496,6 +496,7 @@ function StudentDashboard({
   });
   const [profileMessage, setProfileMessage] = useState('');
   const [profileSaving, setProfileSaving] = useState(false);
+  const [profileLastUpdated, setProfileLastUpdated] = useState(user?.updated_at || user?.updatedAt || null);
 
   // ለድጋፍ ፎም መቆጣጠሪያዎች (Support/Report Form States)
   const [supportSubject, setSupportSubject] = useState('');
@@ -548,10 +549,6 @@ function StudentDashboard({
   const [transactionFilter, setTransactionFilter] = useState('all');
   const [transactionSearch, setTransactionSearch] = useState('');
   const [hiddenTransactions, setHiddenTransactions] = useState([]);
-  const [hiddenTransactionsCount, setHiddenTransactionsCount] = useState(0);
-  const [hiddenTransactionsLoading, setHiddenTransactionsLoading] = useState(false);
-  const [transactionVisibilityActionId, setTransactionVisibilityActionId] = useState(null);
-  const [transactionVisibilityError, setTransactionVisibilityError] = useState('');
   const [paymentVerificationState, setPaymentVerificationState] = useState('');
   const [showWithdrawModal, setShowWithdrawModal] = useState(false);
   const [withdrawAmount, setWithdrawAmount] = useState('');
@@ -576,7 +573,6 @@ function StudentDashboard({
   const [withdrawProviderUnavailable, setWithdrawProviderUnavailable] = useState(false);
   const [activeWithdrawal, setActiveWithdrawal] = useState(null);
   const [withdrawalStatusLoading, setWithdrawalStatusLoading] = useState(false);
-  const [payoutStatusCheckId, setPayoutStatusCheckId] = useState(null);
   const [returnToWithdrawAfterPayoutSetup, setReturnToWithdrawAfterPayoutSetup] = useState(false);
   const [withdrawError, setWithdrawError] = useState('');
   const [withdrawLoading, setWithdrawLoading] = useState(false);
@@ -685,6 +681,7 @@ function StudentDashboard({
   const [avatarFile, setAvatarFile] = useState(null);
   const [avatarUploadMessage, setAvatarUploadMessage] = useState('');
   const [avatarUploading, setAvatarUploading] = useState(false);
+  const [avatarRemoving, setAvatarRemoving] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState(user?.avatarUrl || '');
 
   const normalizePrice = (possiblePrice) => {
@@ -799,8 +796,6 @@ function StudentDashboard({
     }
   };
   const currentWalletBalance = Number(walletBalance ?? paymentInfo?.balance ?? 0);
-  const heldWalletBalance = Number(paymentInfo?.heldBalance || 0);
-  const withdrawalEntryBlocked = currentWalletBalance <= 0 || Boolean(activeWithdrawal);
   const withdrawAmountValue = Number(withdrawAmount);
   const withdrawExceedsBalance = withdrawAmount !== '' && Number.isFinite(withdrawAmountValue) && withdrawAmountValue > currentWalletBalance;
 
@@ -842,38 +837,45 @@ function StudentDashboard({
     };
   };
 
-  const getTransactionCategory = (tx) => {
-    const typeAndLabel = `${tx?.type || ''} ${tx?.label || ''}`.toLowerCase();
-    if (typeAndLabel.includes('withdraw') || typeAndLabel.includes('payout')) return 'withdrawals';
-    if (getTransactionDirection(tx).sign === '+') return 'deposits';
-    return 'payments';
-  };
-
   const getTransactionAmount = (tx) => {
     const amount = Number(tx.amount ?? tx.value ?? 0);
     return Number.isFinite(amount) ? Math.abs(amount) : 0;
   };
 
-  const totalDeposited = allTransactionLedger.reduce((total, tx) => (
-    getTransactionDirection(tx).sign === '+'
-      ? total + getTransactionAmount(tx)
-      : total
-  ), 0);
-  const totalSpent = allTransactionLedger.reduce((total, tx) => (
-    getTransactionDirection(tx).sign === '-'
-      ? total + getTransactionAmount(tx)
-      : total
-  ), 0);
-  const transactionsForView = transactionFilter === 'hidden' ? hiddenTransactions : transactionLedger;
+  const getTransactionOrderId = (tx) => {
+    const explicitOrderId = tx?.order_id ?? tx?.orderId;
+    if (/^\d+$/.test(String(explicitOrderId ?? '')) && Number(explicitOrderId) > 0) {
+      return String(explicitOrderId);
+    }
+    const label = `${tx?.label || ''} ${tx?.description || ''}`;
+    return label.match(/\border\s*#?\s*(\d+)/i)?.[1] || null;
+  };
+  const isSuccessfulTransaction = (tx) => (
+    ['successful', 'success', 'completed', 'paid'].includes(String(tx?.status || '').trim().toLowerCase())
+  );
+  const isOrderPaymentTransaction = (tx) => {
+    const type = String(tx?.type || '').trim().toLowerCase();
+    const label = String(tx?.label || tx?.description || '').trim().toLowerCase();
+    return type.includes('product purchase')
+      || label.includes('split payment')
+      || Boolean(getTransactionOrderId(tx));
+  };
+  const paymentTransactions = allTransactionLedger.filter(isOrderPaymentTransaction);
+  const successfulPaymentTransactions = paymentTransactions.filter(isSuccessfulTransaction);
+  const totalSpent = successfulPaymentTransactions.reduce((total, tx) => total + getTransactionAmount(tx), 0);
+  const transactionsForView = [...transactionLedger, ...hiddenTransactions]
+    .filter(isOrderPaymentTransaction);
   const filteredTransactions = transactionsForView.filter((tx) => {
-    const matchesFilter = transactionFilter === 'hidden'
-      || transactionFilter === 'all'
-      || getTransactionCategory(tx) === transactionFilter;
+    const rawStatus = String(tx?.status || '').trim().toLowerCase();
+    const matchesFilter = transactionFilter === 'all'
+      || (transactionFilter === 'successful' && isSuccessfulTransaction(tx))
+      || (transactionFilter === 'failed' && (rawStatus.includes('fail') || rawStatus.includes('cancel')));
     const searchableText = [
       tx?.label,
       tx?.type,
       tx?.description,
       tx?.hash,
+      tx?.tx_ref,
       tx?.reference,
       tx?.reference_id,
       tx?.reference_number,
@@ -886,7 +888,7 @@ function StudentDashboard({
 
   const getTransactionStatusClass = (status) => {
     const normalizedStatus = String(status || '').trim().toLowerCase();
-    if (normalizedStatus.includes('fail')) return 'border-rose-100 bg-rose-50 text-rose-700';
+    if (normalizedStatus.includes('fail') || normalizedStatus.includes('cancel')) return 'border-rose-100 bg-rose-50 text-rose-700';
     if (normalizedStatus.includes('pend') || normalizedStatus.includes('process')) return 'border-amber-100 bg-amber-50 text-amber-700';
     return 'border-emerald-100 bg-emerald-50 text-emerald-700';
   };
@@ -971,8 +973,6 @@ function StudentDashboard({
         const nextBalance = Number(payData?.balance ?? payData?.walletBalance ?? payData?.wallet_balance ?? 0);
         const normalizedBalance = Number.isFinite(nextBalance) ? nextBalance : 0;
         const normalizedTransactions = Array.isArray(payData?.transactions) ? payData.transactions : [];
-        setHiddenTransactionsCount(Number(payData?.hidden_count || 0));
-
         setPaymentInfo({
           balance: normalizedBalance,
           heldBalance: Number(payData?.held_balance || 0),
@@ -995,7 +995,6 @@ function StudentDashboard({
         const hiddenPayData = await hiddenPayRes.json();
         const hiddenTransactionRows = Array.isArray(hiddenPayData?.transactions) ? hiddenPayData.transactions : [];
         setHiddenTransactions(hiddenTransactionRows);
-        setHiddenTransactionsCount(Number(hiddenPayData?.hidden_count ?? hiddenTransactionRows.length));
       }
     } catch (err) {
       console.error('Error fetching buyer data:', err);
@@ -1073,76 +1072,6 @@ function StudentDashboard({
   const handleOrdersViewChange = async (hidden) => {
     setShowHiddenOrders(hidden);
     await loadOrdersView(hidden);
-  };
-
-  const loadHiddenTransactions = async () => {
-    if (!studentId) return;
-    const token = getStudentSessionToken();
-    setHiddenTransactionsLoading(true);
-    setTransactionVisibilityError('');
-    try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/student/payments?student_id=${encodeURIComponent(studentId)}&hidden=true`,
-        { cache: 'no-store', headers: token ? { Authorization: `Bearer ${token}` } : {} },
-      );
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.detail || 'Unable to load hidden transactions.');
-      const rows = Array.isArray(data?.transactions) ? data.transactions : [];
-      setHiddenTransactions(rows);
-      setHiddenTransactionsCount(Number(data?.hidden_count ?? rows.length));
-    } catch (error) {
-      setTransactionVisibilityError(error.message || 'Unable to load hidden transactions.');
-    } finally {
-      setHiddenTransactionsLoading(false);
-    }
-  };
-
-  const handleTransactionVisibility = async (transaction) => {
-    if (!transaction?.id) return;
-    const isHidden = transactionFilter === 'hidden';
-    const actionId = transaction.id;
-    const token = getStudentSessionToken();
-    setTransactionVisibilityActionId(actionId);
-    setTransactionVisibilityError('');
-    const updateTransactionVisibilityState = (hidden) => {
-      if (hidden) {
-        setPaymentInfo((previous) => ({
-          ...previous,
-          transactions: (Array.isArray(previous.transactions) ? previous.transactions : []).filter((item) => item.id !== actionId),
-        }));
-        setHiddenTransactions((previous) => [{ ...transaction, is_hidden: true }, ...previous.filter((item) => item.id !== actionId)]);
-        setHiddenTransactionsCount((previous) => previous + 1);
-      } else {
-        setHiddenTransactions((previous) => previous.filter((item) => item.id !== actionId));
-        setPaymentInfo((previous) => ({
-          ...previous,
-          transactions: [
-            { ...transaction, is_hidden: false },
-            ...(Array.isArray(previous.transactions) ? previous.transactions : []).filter((item) => item.id !== actionId),
-          ].slice(0, 20),
-        }));
-        setHiddenTransactionsCount((previous) => Math.max(0, previous - 1));
-      }
-    };
-    updateTransactionVisibilityState(!isHidden);
-    try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/student/wallet/transactions/${encodeURIComponent(actionId)}/${isHidden ? 'unhide' : 'hide'}`,
-        { method: 'PATCH', headers: token ? { Authorization: `Bearer ${token}` } : {} },
-      );
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.detail || `Unable to ${isHidden ? 'restore' : 'hide'} this transaction.`);
-      notifySuccess(
-        isHidden ? 'Transaction restored to history.' : 'Transaction hidden from history.',
-        `student-transaction-visibility-${actionId}`,
-      );
-    } catch (error) {
-      updateTransactionVisibilityState(isHidden);
-      setTransactionVisibilityError(error.message || `Unable to ${isHidden ? 'restore' : 'hide'} this transaction.`);
-      notifyError(error, `student-transaction-visibility-${actionId}`);
-    } finally {
-      setTransactionVisibilityActionId(null);
-    }
   };
 
   const isReceiptUnavailable = (orderId) => {
@@ -2328,6 +2257,7 @@ function StudentDashboard({
           });
         }
       }
+      setAvatarFile(null);
       setAvatarUploadMessage('Avatar uploaded successfully.');
       notifySuccess(studentToast('avatarUploaded'), 'student-avatar-upload');
     } catch (err) {
@@ -2345,6 +2275,61 @@ function StudentDashboard({
       [field]: value,
       ...(field === 'college' ? { department: '' } : {})
     }));
+  };
+
+  const handleProfileReset = () => {
+    setProfileForm({
+      name: user?.name || '',
+      studentId: user?.studentId || user?.student_id || '',
+      email: user?.email || '',
+      phone: user?.phone || '',
+      college: user?.college || '',
+      department: user?.department || '',
+    });
+    setProfileMessage('');
+  };
+
+  const handleAvatarRemoveSubmit = async () => {
+    const token = user?.access_token || '';
+    if (!token) {
+      const error = new Error('Your authenticated session is missing. Please sign in again.');
+      setAvatarUploadMessage(error.message);
+      notifyError(error, 'student-avatar-remove');
+      return;
+    }
+
+    setAvatarRemoving(true);
+    setAvatarUploadMessage('');
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/student/profile/avatar`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.detail || 'Unable to remove profile photo.');
+
+      setAvatarUrl('');
+      setAvatarFile(null);
+      setAvatarUploadMessage('Profile photo removed.');
+      if (onUserUpdate) {
+        onUserUpdate((currentUser) => {
+          const updatedUser = { ...(currentUser || user), avatarUrl: '', avatar_url: null };
+          if (typeof window !== 'undefined') {
+            const saved = window.localStorage.getItem('campaceSession');
+            const session = saved ? JSON.parse(saved) : {};
+            window.localStorage.setItem('campaceSession', JSON.stringify({ ...session, user: updatedUser }));
+          }
+          return updatedUser;
+        });
+      }
+      notifySuccess('Profile photo removed.', 'student-avatar-remove');
+    } catch (error) {
+      console.error('Avatar removal failed:', error);
+      setAvatarUploadMessage(error.message || 'Unable to remove profile photo.');
+      notifyError(error, 'student-avatar-remove');
+    } finally {
+      setAvatarRemoving(false);
+    }
   };
 
   const handleProfileSubmit = async (e) => {
@@ -2402,6 +2387,7 @@ function StudentDashboard({
       setProfileForm((previous) => ({ ...previous, studentId: data.user.studentId || previous.studentId }));
       onUserUpdate(updatedUser);
       setProfileMessage('Profile updated successfully.');
+      setProfileLastUpdated(new Date().toISOString());
       notifySuccess(studentToast('profileSaved'), 'student-profile-save');
 
       if (typeof window !== 'undefined') {
@@ -3157,16 +3143,6 @@ function StudentDashboard({
     }
   };
 
-  const handlePayoutStatusCheck = async (transaction) => {
-    setPayoutStatusCheckId(transaction.id || transaction.hash);
-    try {
-      await refreshWithdrawalStatus();
-      await fetchBuyerDashboardData();
-    } finally {
-      setPayoutStatusCheckId(null);
-    }
-  };
-
   const verifyDepositByReference = async (transactionReference, isActive = () => true) => {
     const token = getStudentSessionToken();
     const response = await fetch(
@@ -3215,36 +3191,6 @@ function StudentDashboard({
     return { status, data };
   };
   depositVerificationHandlerRef.current = verifyDepositByReference;
-
-  const handleDepositStatusCheck = async (transaction) => {
-    setPayoutStatusCheckId(transaction.id || transaction.hash);
-    try {
-      const token = getStudentSessionToken();
-      const response = await fetch(`${API_BASE_URL}/api/payment/verify/${encodeURIComponent(transaction.hash)}`, {
-        headers: token ? { Authorization: 'Bearer ' + token } : {},
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        const detail = typeof data?.detail === 'string' ? data.detail : data?.detail?.message;
-        throw new Error(getErrorMessage({ detail }));
-      }
-      await fetchBuyerDashboardData();
-      setWithdrawError(data?.status === 'Successful'
-        ? `${transaction.amount || 0} ETB deposit confirmed and added to your wallet.`
-        : 'Chapa has not confirmed this deposit yet.');
-      if (String(data?.status || '').toLowerCase() === 'successful') {
-        notifySuccess(studentToast('paymentVerified'), `student-payment-check-${transaction.hash}`);
-      } else {
-        notifyInfo(studentToast('paymentPending'), `student-payment-check-${transaction.hash}`);
-      }
-    } catch (error) {
-      console.error('Deposit status check failed:', error);
-      setWithdrawError(getErrorMessage(error));
-      notifyError(error, `student-payment-check-${transaction.hash}`);
-    } finally {
-      setPayoutStatusCheckId(null);
-    }
-  };
 
   useEffect(() => {
     const transactions = Array.isArray(paymentInfo?.transactions) ? paymentInfo.transactions : [];
@@ -4971,6 +4917,35 @@ function StudentDashboard({
             })}
           </nav>
 
+          {dashboardMode === 'buyer' && (
+            <section className={`${isSidebarCollapsed ? 'hidden' : 'hidden lg:block'} mx-3 mb-4 min-w-0 rounded-2xl border border-slate-800 bg-slate-900/80 p-4 shadow-lg backdrop-blur-sm`} aria-label="Campus safe trade and support">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-400">
+                  <ShieldCheck size={19} aria-hidden="true" />
+                  <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-emerald-400 ring-2 ring-slate-900 animate-pulse" aria-hidden="true" />
+                </span>
+                <h2 className="min-w-0 text-sm font-bold leading-tight text-white">Safe UniXchange Trade</h2>
+              </div>
+              <p className="mt-3 text-xs leading-relaxed text-slate-300">
+                Meet in public campus areas and inspect items thoroughly before paying.
+              </p>
+              <button
+                type="button"
+                onClick={() => handleStudentSidebarNavigation({
+                  key: 'reports-support',
+                  label: 'Support & Reports',
+                  tab: 'buyer',
+                  buyerSection: 'reports-support',
+                  mode: 'buyer',
+                })}
+                className="mt-3 flex w-full min-w-0 items-center justify-center gap-1.5 rounded-xl border border-sky-500/30 bg-sky-500/10 px-2 py-2 text-xs font-medium text-sky-400 transition-all hover:bg-sky-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+              >
+                <MessageCircle size={14} className="shrink-0" aria-hidden="true" />
+                <span className="truncate">Need Help? Chat Support</span>
+              </button>
+            </section>
+          )}
+
         </aside>
 
         {/* በሞባይል ስልኮች ላይ የጎን ማውጫው ሲከፈት በስተጀርባ የሚመጣ ጥቁር ጥላ (Mobile Overlay Backdrop) */}
@@ -5190,6 +5165,13 @@ function StudentDashboard({
                   onViewReceipt={handleViewPaymentReceipt}
                   onDownloadReceipt={handleDownloadPaymentReceipt}
                   onPrintReceipt={handlePrintPaymentReceipt}
+                  reviewRating={reviewRating}
+                  setReviewRating={setReviewRating}
+                  reviewComment={reviewComment}
+                  setReviewComment={setReviewComment}
+                  onSubmitReview={handleSubmitReview}
+                  isSubmittingReview={isSubmittingReview}
+                  reviewFeedback={reviewFeedback}
                 />
               </>
             )}
@@ -5751,61 +5733,56 @@ function StudentDashboard({
                     <div className="grid gap-4 sm:grid-cols-3">
                       <div className="flex min-w-0 items-center gap-4 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
                         <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-sky-50 text-sky-700">
-                          <Wallet size={22} aria-hidden="true" />
+                          <ShoppingBag size={22} aria-hidden="true" />
                         </span>
                         <div className="min-w-0">
-                          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Wallet Balance</p>
-                          <p className="mt-1 truncate text-xl font-bold text-slate-900">{formatETB(currentWalletBalance)}</p>
-                          {heldWalletBalance > 0 && <p className="mt-1 text-xs text-amber-700">{formatETB(heldWalletBalance)} held</p>}
+                          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Total Spent / Purchases</p>
+                          <p className="mt-1 truncate text-xl font-bold text-slate-900">{formatETB(totalSpent)}</p>
                         </div>
                       </div>
                       <div className="flex min-w-0 items-center gap-4 rounded-3xl border border-emerald-100 bg-white p-5 shadow-sm">
                         <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-emerald-700">
-                          <ArrowDownLeft size={22} aria-hidden="true" />
+                          <Check size={22} aria-hidden="true" />
                         </span>
                         <div className="min-w-0">
-                          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Total Deposited</p>
-                          <p className="mt-1 truncate text-xl font-bold text-emerald-700">+{formatETB(totalDeposited)}</p>
+                          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Successful Orders Paid</p>
+                          <p className="mt-1 truncate text-xl font-bold text-emerald-700">{successfulPaymentTransactions.length}</p>
+                          <p className="mt-1 text-xs text-slate-500">Completed payments</p>
                         </div>
                       </div>
-                      <div className="flex min-w-0 items-center gap-4 rounded-3xl border border-rose-100 bg-white p-5 shadow-sm">
-                        <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-rose-50 text-rose-700">
-                          <ArrowUpRight size={22} aria-hidden="true" />
+                      <div className="flex min-w-0 items-center gap-4 rounded-3xl border border-sky-100 bg-white p-5 shadow-sm">
+                        <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-sky-50 text-sky-700">
+                          <ShieldCheck size={22} aria-hidden="true" />
                         </span>
                         <div className="min-w-0">
-                          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Total Spent</p>
-                          <p className="mt-1 truncate text-xl font-bold text-rose-700">-{formatETB(totalSpent)}</p>
+                          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Security &amp; Settlement</p>
+                          <p className="mt-1 truncate text-lg font-bold text-slate-900">Chapa Split Verified 🛡️</p>
+                          <p className="mt-1 text-xs text-slate-500">Payments settle directly to sellers</p>
                         </div>
                       </div>
                     </div>
 
-                    <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
+                    <div className="grid gap-6">
                       <div className="min-w-0 rounded-[32px] border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
                         <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
                           <div>
-                            <h3 className="text-xl font-bold text-slate-900">Transactions &amp; Wallet</h3>
-                            <p className="mt-1 text-sm text-slate-500">Review your wallet activity and payment history.</p>
+                            <h3 className="text-xl font-bold text-slate-900">Payment History &amp; Receipts</h3>
+                            <p className="mt-1 text-sm text-slate-500">Review order payments, transaction references, and downloadable receipts.</p>
                           </div>
-                          <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700">{transactionsForView.length} records</span>
+                          <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700">{transactionsForView.length} transactions</span>
                         </div>
 
                         <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                           <div className="flex flex-wrap gap-2" aria-label="Filter transactions">
                             {[
-                              { id: 'all', label: 'All' },
-                              { id: 'deposits', label: 'Deposits' },
-                              { id: 'payments', label: 'Payments' },
-                              { id: 'withdrawals', label: 'Withdrawals' },
-                              { id: 'hidden', label: hiddenTransactionsCount > 0 ? `Hidden (${hiddenTransactionsCount})` : 'Hidden' },
+                              { id: 'all', label: 'All Transactions' },
+                              { id: 'successful', label: 'Successful' },
+                              { id: 'failed', label: 'Failed/Cancelled' },
                             ].map((filter) => (
                               <button
                                 key={filter.id}
                                 type="button"
-                                onClick={() => {
-                                  setTransactionFilter(filter.id);
-                                  if (filter.id === 'hidden') loadHiddenTransactions();
-                                  else setTransactionVisibilityError('');
-                                }}
+                                onClick={() => setTransactionFilter(filter.id)}
                                 aria-pressed={transactionFilter === filter.id}
                                 className={`rounded-full px-3.5 py-2 text-xs font-semibold transition ${transactionFilter === filter.id ? 'bg-slate-900 text-white shadow-sm' : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
                               >
@@ -5826,32 +5803,28 @@ function StudentDashboard({
                           </label>
                         </div>
 
-                        {transactionVisibilityError && (
-                          <p role="alert" className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-                            {transactionVisibilityError}
-                          </p>
-                        )}
-
                         <div className="max-h-[30rem] space-y-2 overflow-y-auto pr-1">
-                          {hiddenTransactionsLoading && transactionFilter === 'hidden' ? (
-                            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">Loading hidden transactions...</div>
-                          ) : filteredTransactions.length === 0 ? (
+                          {filteredTransactions.length === 0 ? (
                             <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
-                              {transactionFilter === 'hidden'
-                                ? 'No hidden transactions.'
-                                : transactionLedger.length === 0
-                                  ? 'No transaction records found. Your wallet deposits and product purchases will appear here.'
-                                  : 'No transactions match your filters.'}
+                              {transactionsForView.length === 0
+                                ? 'No order payments yet. Your Chapa split payments will appear here.'
+                                : 'No transactions match your filters.'}
                             </div>
                           ) : (
                             filteredTransactions.map((tx) => {
                               const amount = getTransactionAmount(tx);
-                              const { sign, colorClass } = getTransactionDirection(tx);
-                              const isCredit = sign === '+';
-                              const status = normalizePaymentStatus(tx.status);
-                              const isPendingTransaction = ['pending', 'processing'].includes(String(tx.status || '').trim().toLowerCase());
-                              const isWithdrawal = getTransactionCategory(tx) === 'withdrawals';
-                              const isDeposit = getTransactionCategory(tx) === 'deposits';
+                              const rawStatus = String(tx.status || '').trim().toLowerCase();
+                              const isSuccessful = isSuccessfulTransaction(tx);
+                              const isFailed = rawStatus.includes('fail') || rawStatus.includes('cancel');
+                              const status = isSuccessful ? 'Successful' : isFailed ? (rawStatus.includes('cancel') ? 'Cancelled' : 'Failed') : normalizePaymentStatus(tx.status);
+                              const orderId = getTransactionOrderId(tx);
+                              const matchingOrder = orderId
+                                ? orders.find((order) => String(order.id) === String(orderId))
+                                : null;
+                              const orderUrl = orderId && (!isFailed || matchingOrder)
+                                ? buildOrderDashboardUrl(orderId, 'buyer')
+                                : null;
+                              const transactionReference = tx.tx_ref || tx.hash || tx.transaction_reference || tx.transaction_id || tx.reference;
                               const timestamp = tx.created_at || tx.date;
                               const parsedTimestamp = timestamp ? new Date(timestamp) : null;
                               const timestampLabel = parsedTimestamp && !Number.isNaN(parsedTimestamp.getTime())
@@ -5859,122 +5832,98 @@ function StudentDashboard({
                                 : timestamp || 'Date unavailable';
 
                               return (
-                                <div key={tx.id || tx.hash || `${tx.label}-${tx.date}`} className="flex min-w-0 items-center gap-3 rounded-2xl border border-slate-100 bg-white px-3 py-3 transition hover:border-slate-200 hover:bg-slate-50/60 sm:px-4">
-                                  <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${isCredit ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'}`}>
-                                    {isCredit
-                                      ? <ArrowDownLeft size={18} aria-hidden="true" />
-                                      : <ArrowUpRight size={18} aria-hidden="true" />}
-                                  </span>
+                                <article key={tx.id || transactionReference || `${tx.label}-${tx.date}`} className="flex min-w-0 flex-col gap-3 rounded-2xl border border-slate-100 bg-white px-4 py-4 transition hover:border-slate-200 hover:bg-slate-50/60 sm:flex-row sm:items-center sm:justify-between sm:px-5">
                                   <div className="min-w-0 flex-1">
                                     <div className="flex min-w-0 flex-wrap items-center gap-2">
-                                      <p className="max-w-full truncate text-sm font-semibold text-slate-900">{getTransactionLabel(tx)}</p>
+                                      <p className="max-w-full break-words text-sm font-semibold text-slate-900">
+                                        {isFailed
+                                          ? `Payment Attempt Unsuccessful${orderId ? ` • Order #${orderId}` : ''}`
+                                          : getTransactionLabel(tx)}
+                                      </p>
+                                      {orderId && !isFailed && (
+                                        <a
+                                          href={orderUrl}
+                                          className="shrink-0 text-xs font-bold text-sky-700 underline decoration-sky-200 underline-offset-2 hover:text-sky-900"
+                                        >
+                                          Order #{orderId}
+                                        </a>
+                                      )}
                                       {tx.test_mode && <span className="rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[9px] font-extrabold text-amber-800">TEST</span>}
                                     </div>
-                                    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-slate-500">
+                                    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-slate-500">
                                       <span>{timestampLabel}</span>
-                                      <span className={`rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase ${getTransactionStatusClass(status)}`}>{status}</span>
-                                      {tx.hash && (
-                                        <span className="inline-flex min-w-0 items-center gap-1">
-                                          <span className="max-w-32 truncate font-mono" title={tx.hash}>{tx.hash}</span>
+                                      <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-semibold ${getTransactionStatusClass(status)}`}>
+                                        <span className={`h-1.5 w-1.5 rounded-full ${isSuccessful ? 'bg-emerald-500' : isFailed ? 'bg-rose-500' : 'bg-amber-500'}`} aria-hidden="true" />
+                                        {status}
+                                      </span>
+                                      <span className="inline-flex min-w-0 items-center gap-1">
+                                        <span className="shrink-0">Chapa ref</span>
+                                        <span className="max-w-40 truncate font-mono text-slate-700" title={transactionReference || 'Reference unavailable'}>{transactionReference || 'Reference unavailable'}</span>
+                                        {transactionReference && (
                                           <button
                                             type="button"
-                                            onClick={() => copyTransactionHash(tx.hash)}
-                                            title={copiedTransactionHash === tx.hash ? 'Copied' : 'Copy transaction hash'}
-                                            aria-label={copiedTransactionHash === tx.hash ? 'Transaction hash copied' : 'Copy transaction hash'}
+                                            onClick={() => copyTransactionHash(transactionReference)}
+                                            title={copiedTransactionHash === transactionReference ? 'Copied' : 'Copy Chapa reference'}
+                                            aria-label={copiedTransactionHash === transactionReference ? 'Chapa reference copied' : 'Copy Chapa reference'}
                                             className="rounded p-1 text-slate-400 transition hover:bg-slate-200 hover:text-slate-700"
                                           >
-                                            {copiedTransactionHash === tx.hash
+                                            {copiedTransactionHash === transactionReference
                                               ? <Check size={13} aria-hidden="true" />
                                               : <Copy size={13} aria-hidden="true" />}
                                           </button>
-                                        </span>
-                                      )}
+                                        )}
+                                      </span>
                                     </div>
-                                    {isPendingTransaction && (isWithdrawal || isDeposit) && (
-                                      <button
-                                        type="button"
-                                        onClick={() => isWithdrawal ? handlePayoutStatusCheck(tx) : handleDepositStatusCheck(tx)}
-                                        disabled={payoutStatusCheckId === (tx.id || tx.hash)}
-                                        className="mt-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-bold text-amber-800 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
-                                      >
-                                        {payoutStatusCheckId === (tx.id || tx.hash) ? 'Checking status...' : isDeposit ? 'Check Deposit Status' : 'Check Payout Status'}
-                                      </button>
+                                    {isFailed && (
+                                      <p className="mt-1.5 text-xs text-slate-500">
+                                        No charges were made to your account. You can retry paying anytime.
+                                      </p>
                                     )}
                                   </div>
-                                  <div className="flex shrink-0 flex-col items-end gap-2">
-                                    <span className={`text-sm font-bold sm:text-base ${colorClass}`}>
-                                      {sign}{formatETB(Math.abs(amount))}
-                                    </span>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleTransactionVisibility(tx)}
-                                      disabled={transactionVisibilityActionId === tx.id}
-                                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
-                                    >
-                                      {transactionVisibilityActionId === tx.id
-                                        ? 'Saving...'
-                                        : transactionFilter === 'hidden' ? 'Unhide' : 'Hide'}
-                                    </button>
+                                  <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 sm:justify-end">
+                                    {isFailed ? (
+                                      <div className="flex flex-wrap items-center gap-3">
+                                        <span className="inline-flex items-center gap-2">
+                                          <span className="text-sm font-semibold text-slate-400 line-through">{formatETB(amount)}</span>
+                                          <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500">Uncharged</span>
+                                        </span>
+                                        {orderUrl ? (
+                                          <a
+                                            href={orderUrl}
+                                            className="inline-flex items-center justify-center rounded-full bg-sky-700 px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-sky-800"
+                                          >
+                                            View Order #{orderId}
+                                          </a>
+                                        ) : (
+                                          <button
+                                            type="button"
+                                            onClick={() => handleStudentSidebarNavigation({ key: 'marketplace', tab: 'buyer', buyerSection: 'search', mode: 'buyer' })}
+                                            className="inline-flex items-center justify-center rounded-full border border-sky-200 bg-sky-50 px-3.5 py-2 text-xs font-semibold text-sky-800 transition hover:bg-sky-100"
+                                          >
+                                            Browse Products
+                                          </button>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <>
+                                        <span className="text-base font-bold text-slate-900">-{formatETB(amount)}</span>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleDownloadPaymentReceipt(orderId).catch((error) => notifyError(error, 'student-payment-receipt'))}
+                                          disabled={!orderId || !isSuccessful}
+                                          title={!orderId ? 'Receipt unavailable for this transaction' : !isSuccessful ? 'Receipt available after successful payment' : 'Download payment receipt PDF'}
+                                          className="inline-flex items-center justify-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 transition hover:border-sky-200 hover:bg-sky-50 hover:text-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
+                                        >
+                                          <FileDown size={15} aria-hidden="true" />
+                                          View Receipt / PDF
+                                        </button>
+                                      </>
+                                    )}
                                   </div>
-                                </div>
+                                </article>
                               );
                             })
                           )}
-                        </div>
-                      </div>
-
-                      <div className="rounded-[32px] border border-slate-200 bg-white p-6 shadow-sm">
-                        <div className="mb-4 flex items-center justify-between gap-3">
-                          <h3 className="text-xl font-bold text-slate-900 border-b pb-2 mb-0 flex-1">Wallet Actions</h3>
-                          <button
-                            type="button"
-                            disabled={withdrawLoading || withdrawalEntryBlocked}
-                            title={activeWithdrawal ? 'A payout is currently processing' : currentWalletBalance <= 0 ? 'Add funds before withdrawing' : 'Withdraw funds'}
-                            onClick={() => setShowWithdrawModal(true)}
-                            className="rounded-full border border-slate-200 bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
-                          >
-                            Withdraw Funds
-                          </button>
-                        </div>
-                        {activeWithdrawal && (
-                          <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm font-medium text-amber-800">
-                            <span>You have a payout currently processing. You can request a new withdrawal once it completes.</span>
-                            <button type="button" onClick={refreshWithdrawalStatus} disabled={withdrawalStatusLoading} className="font-bold text-amber-900 underline underline-offset-2 disabled:opacity-60">
-                              {withdrawalStatusLoading ? 'Refreshing...' : 'Refresh status'}
-                            </button>
-                          </div>
-                        )}
-
-                        <div className="space-y-5">
-                          <div>
-                            <h3 className="text-xl font-bold text-slate-900 border-b pb-2 mb-4">Deposit via Chapa</h3>
-                            <p className="text-sm text-slate-500">Top up your wallet securely through Chapa checkout.</p>
-                            {paymentVerificationState === 'confirming' && <p className="mt-3 rounded-xl bg-sky-50 px-3 py-2 text-sm font-semibold text-sky-700">Confirming your payment...</p>}
-                            {paymentVerificationState === 'pending' && <p className="mt-3 rounded-xl bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-700">Your payment is still being confirmed...</p>}
-                            {paymentVerificationState === 'pending_timeout' && <p className="mt-3 rounded-xl bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-700">We're still confirming — check back shortly.</p>}
-                            <form onSubmit={handleDepositSubmit} className="mt-5 space-y-4">
-                              <div>
-                                <label className="block text-sm font-semibold text-slate-700">Amount (ETB)</label>
-                                <input
-                                  type="number"
-                                  min="1"
-                                  step="0.01"
-                                  value={depositAmount}
-                                  onChange={(e) => setDepositAmount(e.target.value)}
-                                  placeholder="Enter amount to deposit"
-                                  className="mt-2 block w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm focus:border-emerald-500 focus:bg-white focus:outline-none transition"
-                                />
-                              </div>
-                              {depositError && <p className="text-sm text-red-600">{depositError}</p>}
-                              <button
-                                type="submit"
-                                disabled={depositLoading || !isValidDepositAmount}
-                                className="w-full rounded-full bg-emerald-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-emerald-500 disabled:opacity-60"
-                              >
-                                {depositLoading ? 'Redirecting to Chapa…' : 'Deposit via Chapa'}
-                              </button>
-                            </form>
-                          </div>
                         </div>
                       </div>
                     </div>
@@ -6728,14 +6677,18 @@ function StudentDashboard({
                 setSettingsTab={setSettingsTab}
                 profileForm={profileForm}
                 handleProfileFieldChange={handleProfileFieldChange}
+                handleProfileReset={handleProfileReset}
                 handleProfileSubmit={handleProfileSubmit}
                 profileMessage={profileMessage}
                 profileSaving={profileSaving}
+                profileLastUpdated={profileLastUpdated}
                 user={user}
                 avatarUrl={avatarUrl}
                 avatarFile={avatarFile}
                 setAvatarFile={setAvatarFile}
                 handleAvatarUploadSubmit={handleAvatarUploadSubmit}
+                handleAvatarRemoveSubmit={handleAvatarRemoveSubmit}
+                avatarRemoving={avatarRemoving}
                 avatarUploadMessage={avatarUploadMessage}
                 avatarUploading={avatarUploading}
                 universityStructure={universityStructure}

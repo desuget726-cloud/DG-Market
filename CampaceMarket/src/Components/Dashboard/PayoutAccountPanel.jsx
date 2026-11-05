@@ -1,5 +1,6 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useCallback, useEffect, useState } from 'react';
+import { Building2, Check, Clock3, LockKeyhole, PencilLine, ShieldCheck } from 'lucide-react';
 import { notifyError, notifySuccess } from '../../utils/notify';
 import { API_BASE_URL } from '../../config';
 import {
@@ -324,6 +325,21 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
     const holdDate = account?.payout_hold_until ? new Date(account.payout_hold_until) : null;
     const holdActive = holdDate && !Number.isNaN(holdDate.getTime()) && holdDate.getTime() > currentTime;
     const updatedDate = account?.updated_at ? new Date(account.updated_at) : null;
+    const accountProviderLabel = String(account?.provider || '').trim();
+    const providerIdentity = `${accountProviderLabel} ${account?.bank_code || ''}`.toLowerCase();
+    const connectedProviderKey = providerIdentity.includes('telebirr')
+        ? 'telebirr'
+        : providerIdentity.includes('cbe birr') || providerIdentity.includes('cbebirr')
+            ? 'cbeBirr'
+            : providerIdentity.includes('commercial bank')
+                || providerIdentity.includes('cbe')
+                || String(account?.bank_code || '').toLowerCase() === 'comari'
+                ? 'cbe'
+                : null;
+    const connectedProviderName = connectedProviderKey
+        ? PAYMENT_PROVIDER_LOGOS[connectedProviderKey].name
+        : accountProviderLabel || 'Bank account';
+    const isAccountActive = String(account?.account_status || '').toLowerCase() === 'active';
 
     return (
         <>
@@ -333,7 +349,6 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
                     <h3 className="mt-2 text-2xl font-black text-slate-950">Get paid directly from campus sales</h3>
                     <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">Connect your Ethiopian bank account before publishing products for split payments.</p>
                 </div>
-                {account && !editing && <button type="button" onClick={beginEdit} className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-bold text-slate-700 transition hover:bg-slate-50">Edit</button>}
             </div>
 
             {loadingAccount ? (
@@ -342,14 +357,78 @@ function PayoutAccountPanel({ user, setSellerData, onPayoutAccountUpdated }) {
                     <div className="grid gap-4 sm:grid-cols-2"><div className="h-24 rounded-2xl bg-slate-100" /><div className="h-24 rounded-2xl bg-slate-100" /></div>
                 </div>
             ) : account && !editing ? (
-                <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-5">
-                    <p className="text-xs font-bold uppercase tracking-[0.18em] text-emerald-700">Your payout account</p>
-                    <h4 className="mt-2 text-xl font-bold text-slate-900">{account.business_name || 'Seller payout account'}</h4>
-                    <div className="mt-5 grid gap-4 sm:grid-cols-2">
-                        <div className="rounded-xl border border-slate-200 bg-white p-4"><p className="text-xs font-bold uppercase tracking-[0.16em] text-slate-500">Account name</p><p className="mt-2 font-semibold text-slate-900">{account.account_name || 'Not provided'}</p></div>
-                        <div className="rounded-xl border border-slate-200 bg-white p-4"><p className="text-xs font-bold uppercase tracking-[0.16em] text-slate-500">Provider</p><p className="mt-2 font-semibold text-slate-900">{account.provider || 'Bank account'}{accountMask ? ` · ${accountMask}` : ''}</p></div>
-                        <div className="rounded-xl border border-slate-200 bg-white p-4"><p className="text-xs font-bold uppercase tracking-[0.16em] text-slate-500">Status</p><p className="mt-2 font-semibold text-slate-900">{account.account_status || 'Pending'}</p></div>
-                        <div className="rounded-xl border border-slate-200 bg-white p-4"><p className="text-xs font-bold uppercase tracking-[0.16em] text-slate-500">Last updated</p><p className="mt-2 font-semibold text-slate-900">{updatedDate && !Number.isNaN(updatedDate.getTime()) ? updatedDate.toLocaleString() : 'Not available'}</p></div>
+                <div className="group relative mt-6 overflow-hidden rounded-[26px] border border-slate-700/80 bg-gradient-to-br from-slate-900 via-slate-900 to-slate-800 p-5 text-white shadow-lg transition-all duration-200 hover:-translate-y-0.5 hover:shadow-xl sm:p-7">
+                    <div aria-hidden="true" className="pointer-events-none absolute -right-20 -top-28 h-72 w-72 rounded-full bg-sky-400/10 blur-3xl" />
+                    <div aria-hidden="true" className="pointer-events-none absolute -bottom-28 left-1/3 h-56 w-56 rounded-full bg-emerald-400/10 blur-3xl" />
+                    <div className="relative">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex flex-wrap items-center gap-2.5">
+                                <p className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-300 sm:text-xs">
+                                    <span className="relative flex h-2.5 w-2.5">
+                                        <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-60 ${isAccountActive ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                                        <span className={`relative inline-flex h-2.5 w-2.5 rounded-full ${isAccountActive ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                                    </span>
+                                    Connected payout method
+                                </p>
+                                <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[10px] font-semibold ${isAccountActive ? 'border-emerald-300/20 bg-emerald-300/10 text-emerald-200' : 'border-amber-300/20 bg-amber-300/10 text-amber-200'}`}>
+                                    <Check size={11} aria-hidden="true" />
+                                    {isAccountActive ? 'Active & Verified' : account.account_status || 'Pending'}
+                                </span>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={beginEdit}
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-white/30 hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+                            >
+                                <PencilLine size={14} aria-hidden="true" />
+                                Edit / Change
+                            </button>
+                        </div>
+
+                        <div className="mt-8 flex min-w-0 items-center gap-4">
+                            {connectedProviderKey ? (
+                                <PaymentProviderLogo provider={connectedProviderKey} className="h-12 w-12 rounded-2xl border border-white/10 bg-white p-1 shadow-md" />
+                            ) : (
+                                <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-white/10 text-slate-200 shadow-md">
+                                    <Building2 size={24} aria-hidden="true" />
+                                </span>
+                            )}
+                            <div className="min-w-0">
+                                <h4 className="truncate text-base font-semibold text-white sm:text-lg">{connectedProviderName}</h4>
+                                <p className="mt-1 font-mono text-lg font-bold tracking-[0.12em] text-slate-100 sm:text-xl">
+                                    {accountMask ? `•••• ${accountMask.replace(/\D/g, '').slice(-4)}` : account?.payout_type === 'mobile_wallet' ? 'Mobile wallet' : 'Bank account'}
+                                </p>
+                                {account?.payout_type === 'mobile_wallet' && accountMask && (
+                                    <p className="mt-1 text-[11px] font-medium tracking-normal text-slate-400">{accountMask}</p>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="mt-8 grid grid-cols-1 gap-4 border-t border-white/10 pt-5 sm:grid-cols-2">
+                            <div className="min-w-0">
+                                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Business / Shop name</p>
+                                <p className="mt-1.5 truncate text-sm font-semibold text-white">{account.business_name || 'Seller payout account'}</p>
+                            </div>
+                            <div className="min-w-0">
+                                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Legal account name</p>
+                                <p className="mt-1.5 truncate text-sm font-semibold text-white">{account.account_name || 'Not provided'}</p>
+                            </div>
+                        </div>
+
+                        <div className="mt-5 flex flex-col gap-3 border-t border-white/10 pt-4 sm:flex-row sm:items-end sm:justify-between">
+                            <div className="inline-flex max-w-full items-start gap-2 rounded-xl border border-emerald-300/15 bg-emerald-300/[0.07] px-3 py-2.5 text-xs leading-5 text-emerald-100">
+                                <LockKeyhole size={15} className="mt-0.5 shrink-0 text-emerald-300" aria-hidden="true" />
+                                <span>Encrypted Chapa Split Subaccount. Direct automatic settlements to this account.</span>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1.5 text-[10px] text-slate-400 sm:pb-1">
+                                <Clock3 size={13} aria-hidden="true" />
+                                <span>Last synced {updatedDate && !Number.isNaN(updatedDate.getTime()) ? updatedDate.toLocaleString() : 'Not available'}</span>
+                            </div>
+                        </div>
+                        <div className="mt-3 flex items-center gap-1.5 text-[11px] font-medium text-slate-400">
+                            <ShieldCheck size={14} className="text-emerald-400" aria-hidden="true" />
+                            <span>Protected payout destination</span>
+                        </div>
                     </div>
                     {holdActive && <div role="status" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm font-semibold text-amber-900">Payouts are temporarily on hold until {holdDate.toLocaleString()} because these account details were changed.</div>}
                 </div>

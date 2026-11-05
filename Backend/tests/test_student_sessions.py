@@ -135,6 +135,30 @@ class StudentSessionTests(unittest.TestCase):
         self.assertEqual(len(notifications), 2)
         self.assertTrue(all(notification.message.startswith("New login from ") for notification in notifications))
 
+    def test_remove_student_avatar_requires_an_authenticated_session(self):
+        with self.assertRaises(HTTPException) as raised:
+            main_module.remove_student_avatar(None, self.db)
+
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_remove_student_avatar_clears_the_authenticated_students_photo(self):
+        login = self._login()
+        self.student.avatar_url = "https://res.cloudinary.com/test/image/upload/v123/campace/profiles/photo.webp"
+        self.db.commit()
+
+        with patch.object(main_module, "delete_upload", return_value=True) as delete_avatar:
+            result = main_module.remove_student_avatar(
+                f"Bearer {login['access_token']}",
+                self.db,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(self.student.avatar_url)
+        delete_avatar.assert_called_once_with(
+            "https://res.cloudinary.com/test/image/upload/v123/campace/profiles/photo.webp",
+            "campace/profiles",
+        )
+
     def test_login_persists_forwarded_client_ip_and_resolved_location(self):
         request = self._request(
             "10.0.0.5",
